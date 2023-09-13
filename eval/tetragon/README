@@ -1,0 +1,11 @@
+This directory contains yaml-based policy files that filter for ebpf 
+tracepoint-based syscall events recorded by tetragon. 
+Each file is named {benchmark}_syscall.yaml (with the exception 
+of all_calls.yaml, which is only used for testing purposes)
+and the syscalls predominantly produced by those benchmarks (about the top 80%
+of syscalls) correspond to their respective policy files. Follow 
+the documentation on the Tetragon website if you wish to learn 
+how to apply these policy files at runtime. Tetragon's log file 
+default location is /var/log/tetragon/tetragon.log, but this 
+can be changed from the Tetragon configuration at one's discretion.
+ 

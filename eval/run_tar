@@ -1,0 +1,19 @@
+#!/bin/bash
+
+if (( $# != 2 && $# != 3 )); then
+    echo "Usage: $0 <number_of_parallel_tasks> <loop_count> [<directory>]"
+    exit
+fi
+
+n=$1
+m=$2
+#dir=${3:-/usr/lib}
+dir=${3:-/usr/src}
+time (
+    for (( i=0; i < n; i++ )); do
+        ( for (( j=0; j < m; j++ )); do
+              tar cvf - $dir |& wc --bytes > /dev/null
+          done ) &
+    done
+    wait
+)

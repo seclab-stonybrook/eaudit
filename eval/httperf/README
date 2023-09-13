@@ -1,0 +1,15 @@
+httperf (https://github.com/httperf/httperf) is a performance evaluation tool
+for web servers. For this measurement, it creates a large number of requests to
+the web server. This script wraps the functionality of httperf so that it
+requires only three parameters: the number of http connections, the rate at
+which HTTP requests are made, and the number of concurrent http clients. The
+first two parameters determine the system call rate of the
+benchmark on a single core. The last parameter controls the number of httperf
+processes that will run in parallel. To run httperf, one must do the following:
+
+-- Install the following dependencies with apt: nginx, httperf
+-- Configure nginx to serve static content.
+-- Download content referenced in uris.txt from 
+   http://seclab.cs.sunysb.edu/seclab/pubs/ or modify uris.txt to specify the
+   content you want to download and get fetched.
+

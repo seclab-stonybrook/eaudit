@@ -1,0 +1,80 @@
+#******************************************************************************
+# Copyright 2022-23 Hanke Kimm and Secure Systems Lab, Stony Brook University
+#******************************************************************************
+# This file is part of eAudit.
+# eAudit is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# eAudit is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+# A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# eAudit. If not, see <https://www.gnu.org/licenses/>.
+#****************************************************************************
+
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: test
+spec:
+  tracepoints:
+  - args:
+    - index: 5
+      returnCopy: true
+      type: "path"
+    event: sys_enter_unlink
+    subsystem: syscalls
+  - args:
+    - index: 5
+      type: "int"
+    - index: 6
+      returnCopy: true
+      type: "path"
+    - index: 7
+      type: "int"
+    event: sys_enter_unlinkat
+    subsystem: syscalls
+  - args:
+    - index: 5
+      type: "int"
+    - index: 6
+      returnCopy: true
+      type: "file"
+    - index: 7
+      type: "int"
+    event: sys_enter_openat
+    subsystem: syscalls
+  - args:
+    - index: 5
+      type: "int"
+    event: sys_enter_close
+    subsystem: syscalls
+  - args:
+    - index: 5
+      returnCopy: false
+      type: "int"
+    - index: 6
+      returnCopy: true
+      sizeArgIndex: 8
+      type: "char_buf"
+    - index: 7
+      returnCopy: true
+      type: "size_t"
+    event: sys_enter_read
+    subsystem: syscalls
+  - args:
+    - index: 5
+      returnCopy: false
+      type: fd
+    - index: 6
+      returnCopy: true
+      sizeArgIndex: 8
+      type: "char_buf"
+    - index: 7
+      returnCopy: true
+      type: "size_t"
+    event: sys_enter_write
+    subsystem: syscalls

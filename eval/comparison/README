@@ -1,0 +1,10 @@
+Both of these scripts are used to run comparative measurements 
+for other systems (provbpf, sysdig, auditd). They are "delayed"
+versions of the postmark/shbm benchmarks, meaning that one can insert
+sleep signals perioically as the benchmark runs. This mechanism
+decreases the system call rate of the benchmark compared to if it was
+run without these sleeps. Look at the usage
+information to run them correctly. You must set the SLEEPTIME
+environment variable (export SLEEPTIME=1, for example) if you want 
+to actually insert the sleeps into these benchmarks before running
+them.

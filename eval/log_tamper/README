@@ -1,0 +1,21 @@
+lt_eaudit --> Measures the log tampering window of eAudit. For info
+on how to run it, look at the usage documentation produced
+by the script. Be aware that the script does not produce signals
+to eAudit to generate log tamper windows at runtime, contrary
+to the paper. The script will generate 4 important fields:
+the number of windows generated, avg. # of normal syscalls.
+avg. # of important syscalls, and avg. # of critical syscalls.
+
+lt_sysdig --> Measures the log tampering window of sysdig-capture.
+Instructions:
+
+1. Run sysdig-capture. Wait 5 or so seconds for it to calm down.
+2. Open a new terminal. As sysdig-capture is running, run lt_sysdig. 
+You must run the benchmark you want to run from inside the script. 
+Make sure it is a benchmark that runs at least 10 seconds long.
+3. Wait for the lt_sysdig script to complete. It will print a variable
+called buffer_ratio. Stop sysdig-capture. 
+4. Use buffer_ratio value as a parameter to run the count_recs
+script. It will print the tamper window size.
+
+

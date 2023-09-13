@@ -1,0 +1,23 @@
+#!/bin/bash
+
+if (( $# != 2 )); then
+    echo "Usage: $0 <number_of_parallel_tasks> <loop_count>"
+    exit
+fi
+
+tasks=$1
+iter=$2
+
+helper() {
+    for (( i=0; i < $iter; i++ )); do
+        /bin/echo $i
+    done | wc
+}
+
+time ( 
+    for (( i=0; i < $tasks; i++ )); do
+        helper &
+    done
+    wait 
+)
+

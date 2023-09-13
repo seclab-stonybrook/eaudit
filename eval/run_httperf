@@ -1,0 +1,23 @@
+#!/bin/bash
+if (( $# != 2 )); then
+    echo "Usage: $0 <number_of_parallel_tasks> <iterations>"
+    exit
+fi
+
+cd httperf
+tasks=$1
+iter=$2
+rate=50 
+# A rate of 70 is somewhat faster (maybe 20%) but stick to 50 as we seem to
+# have been using it in a number of measurements so far. 
+
+do_httperf() {
+    httperf --client=$1/$2 --hog --server localhost --port 81 --wsesslog=$3,0,uris.txt --rate $4    
+}
+
+time ( 
+    for (( i=0; i < $tasks; i++ )); do
+         (do_httperf $i $tasks $iter $rate ) &
+    done
+    wait 
+)

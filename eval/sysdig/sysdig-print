@@ -1,0 +1,24 @@
+#!/bin/bash
+
+#******************************************************************************
+# Copyright 2022-23 Hanke Kimm and Secure Systems Lab, Stony Brook University
+#******************************************************************************
+# This file is part of eAudit. This specific script was used in part to produce
+# the results in Section 2 of the eAudit paper (IEEE S&P, 2024).
+#
+# eAudit is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# eAudit is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+# A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# eAudit. If not, see <https://www.gnu.org/licenses/>.
+#****************************************************************************
+
+sudo sysdig -S -F evt.type=open or evt.type=openat or evt.type=creat or evt.type=close or evt.type=dup or evt.type=dup2 or evt.type=dup3 or evt.type=pipe or evt.type=socketpair or evt.type=pipe2 or evt.type=read or evt.type=readv or evt.type=recvmsg or evt.type=recvmmsg or evt.type=pread64 or evt.type=pread or evt.type=preadv or evt.type=recvfrom or evt.type=getpeername or evt.type=accept or evt.type=accept4 or evt.type=connect or evt.type=bind or evt.type=sendto or evt.type=write or evt.type=writev or evt.type=sendmsg or evt.type=sendmmsg or evt.type=pwrite64 or evt.type=pwrite or evt.type=pwritev or evt.type=truncate or evt.type=ftruncate or evt.type=mmap or evt.type=mprotect or evt.type=unlink or evt.type=unlinkat or evt.type=mkdir or evt.type=mkdirat or evt.type=rmdir or evt.type=chdir or evt.type=fchdir or evt.type=link or evt.type=linkat or evt.type=symlink or evt.type=symlinkat or evt.type=rename or evt.type=renameat or evt.type=renameat2 or evt.type=kill or evt.type=tkill or evt.type=tgkill or evt.type=ptrace or evt.type=chmod or evt.type=fchmod or evt.type=fchmodat or evt.type=setresuid or evt.type=setreuid or evt.type=setuid or evt.type=setresgid or evt.type=setregid or evt.type=setgid or evt.type=fork or evt.type=vfork or evt.type=clone or evt.type=clone3 or evt.type=execve or evt.type=execveat or evt.type=exit or evt.type=exit_group or evt.type=finit_module or evt.type=init_module or evt.type=mknod or evt.type=mknodat or evt.type=setfsgid or evt.type=setfsuid or evt.type=socket or evt.type=splice or evt.type=tee or evt.type=vmsplice > /var/tmp/sysdig.prt
+
+

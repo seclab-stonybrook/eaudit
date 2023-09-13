@@ -1,0 +1,10 @@
+rdwr is a simple benchmark designed to exercise the maximum rate at which the OS
+can sustain provenance-related syscalls. It consists of a C-program twrite.c
+that reads from an input file and writes to an output file, and a script that
+launches one or more instances of twrite. A makefile to compile twrite.c and to
+set up the data directory (by untarring rdwr_data.tgz) is included.
+
+To maximize the rate of syscalls, reads and writes should minimize data size,
+i.e., read or write 1 byte per syscall. In addition, we find that using a
+separate input and output file for each twrite process increases performance, as
+compared to all processes reading from /dev/zero or writing to /dev/null.

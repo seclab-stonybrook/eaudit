@@ -1,0 +1,29 @@
+#!/bin/bash
+if (( $# != 3 )); then
+    echo "Usage: $0 <conffile> <number_of_parallel_tasks> <iterations>"
+    exit
+fi
+
+cd postmark 
+make postmark
+
+conf="$1"
+tasks=$2
+iter=$3
+
+do_pm() {
+    for (( j=0; j < $iter; j++ )); do
+        rm -rf $1
+        mkdir $1
+        cd $1
+        echo run | ../postmark ../$conf
+        cd ..
+    done
+}
+
+time ( 
+    for (( i=0; i < $tasks; i++ )); do
+        (do_pm $i) &
+    done
+    wait 
+)

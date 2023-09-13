@@ -1,0 +1,16 @@
+#!/bin/bash
+
+if (( $# < 1 )); then
+    echo "Usage: $0 <number_of_parallel_tasks>"
+    exit
+fi
+
+if [ -d kernel/ ]; then
+    cd kernel
+    make clean >& /dev/null
+    make mrproper >& /dev/null
+    make defconfig >& /dev/null
+    time (make -j$1 >& /dev/null)
+else
+    echo "Aborting: directory kernel/ with Linux kernel source code doesn't exit"
+fi

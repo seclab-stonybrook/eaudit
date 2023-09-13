@@ -1,0 +1,151 @@
+#!/bin/bash
+
+#******************************************************************************
+#  Copyright 2022-23 Hanke Kimm and R. Sekar, Stony Brook University
+#******************************************************************************
+# This file is part of eAudit.
+#
+# eAudit is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# eAudit is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+# A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# eAudit. If not, see <https://www.gnu.org/licenses/>.
+#****************************************************************************
+
+core_ct=`nproc`
+iterations=1
+pcpu_buf=1.6
+wakeup_int=8
+max_padding=160
+bmark_cmd="run_pm pm-config.sm"
+bmark_loops=$core_ct
+rbuf=16
+
+if [[ $# == 0 || "x$1" == 'x-h' || "x$1" == 'x-help' || "x$1" == 'x--help' ]]; then
+   echo "Usage: $0 outfile [benchmark_cmd [benchmark_loops [max_padding "
+   echo "                       [per_cpu_buffer [wakeup_interval [iterations]]]]]]"
+   echo "Defaults: benchmark_cmd=$bmark_cmd, benchmark_loops=$bmark_loops, max_padding=$max_padding, "
+   echo "          per_cpu_buffer=$pcpu_buf, wakeup_interval=$wakeup_int, iterations=$iterations"
+   exit 1
+fi
+
+outfile="$1"
+bmark_cmd=${2:-$bmark_cmd}
+bmark_loops=${3:-$bmark_loops}
+max_padding=${4:-$max_padding}
+pcpu_buf=${5:-$pcpu_buf}
+wakeup_int=${6:-$wakeup_int}
+iterations=${7:-$iterations}
+bmark_nm=$(echo "$bmark_cmd" | awk '{print $1}')
+
+logfile="/tmp/$outfile.log"
+bmoutfile="/tmp/$outfile.bm"
+agoutfile="/tmp/$outfile.ag"
+diag_prefix="eaudit_diagnostic:"
+
+( cd .. && make all ) || exit 1 
+
+if [[ "${outfile##*.}" != "csv" ]]; then
+    echo "outfile should have a csv suffix" && exit 1
+fi
+
+bmark_stats() {
+  elapsedt=`egrep -a ^real $bmoutfile | awk 'NR==1 {print $2}' | awk '{print (($1 * 60) + $2)}' FS='m'`;
+  usert=`grep -a ^user $bmoutfile | awk 'NR==1 {print $2}' | awk '{print (($1 * 60) + $2)}' FS='m'`;
+  syst=`grep -a ^sys $bmoutfile | awk 'NR==1 {print $2}' | awk '{print (($1 * 60) + $2)}' FS='m'`;
+  echo -n "$elapsedt,$usert,$syst," >> $outf
+}
+
+bmark() {
+    # echo ./$*
+    ./$* >& $bmoutfile
+    bmark_stats
+}
+
+agent_stats() {
+    # Truncates minutes field, fix if runs are really long !!!!
+    usert=`grep -a user $agoutfile | awk '{print $1}' FS='user'`;
+    syst=`grep -a user $agoutfile | awk '{print $2}' FS=' ' | awk '{print $1}' FS='system'`;
+    echo -n "$usert,$syst," >> $outf
+
+    if (( $# > 1 )); then
+        syscalls=$(grep -a ${diag_prefix}syscalls $agoutfile | awk '{print $2}' )
+        lost=$(grep -a ${diag_prefix}lost $agoutfile | awk '{print $2}' )
+        avgcallsize=$(grep -a ${diag_prefix}avgcallsize $agoutfile| awk '{print $2}')
+        avgcachesize=$(grep -a \
+                      ${diag_prefix}avgcachesize $agoutfile | awk '{print $2}' )
+        avgp=$(grep -a ${diag_prefix}avgp $agoutfile | awk '{print $2}' )
+        avgw=$(grep -a ${diag_prefix}avgw $agoutfile | awk '{print $2}' )
+        echo -n "$syscalls,$lost,$avgcallsize,$avgcachesize,$avgp,$avgw," \
+             >> $outf
+    fi
+}
+
+agent() {
+    args="-m $diag_prefix -c $logfile -s -v2 -p $1 -b $pcpu_buf -r $rbuf -w $wakeup_int"
+    ( cd .. && ./ecapd $args >& $agoutfile ) &
+    sleep 15
+    agent_pid=$( ps ax| egrep -a '[0-9] python' | grep -a eauditd.py | awk '{print $1}' )
+    shift
+    if (( $# > 1 )); then
+        bmark $*
+    fi
+
+    wrapper=sudo
+    if (( `id -u` == 0 )); then
+        wrapper=
+    fi
+    $wrapper kill $agent_pid || echo "failed: $wrapper kill $agent_pid"
+    sleep 15
+    agent_stats $*
+}
+
+loop_body() {
+    echo -n "$bmark_nm,$i,$padding,$n," >> $outf
+    echo -n "i=$i	n=$n	pad=$padding:	benchmark "
+    # Keep the total workload roughly constant, regardless of the # of cores 
+    # used: so, 1-core load iterates 12 times, while a 12-core load iterates once.
+    # Adding $n/2 to numerator meand we round rather than truncate. 
+    bmark $bmark_cmd $n $(( ($bmark_loops + $n/2)/$n ))
+    sleep 15 # Some time for caches to clear?
+    echo -n "agent "
+    agent $padding
+    echo -n "both"
+    agent $padding $bmark_cmd $n $(( ($bmark_loops + $n/2)/$n ))
+    sleep 45 # Some time for caches to clear?
+    echo ""
+    echo "" >> $outf
+}
+
+n=$core_ct
+padding=0
+i=Warmup
+outf=/dev/null
+loop_body
+outf=$outfile
+
+if [ ! -f "$outf" ]; then
+    echo "bmark,trial,padding,cores,base_bm_wall,base_bm_usr,base_bm_sys," \
+         "base_ag_usr,base_ag_sys,bm_wall,bm_usr,bm_sys," \
+         "ag_usr,ag_sys,sc,lost,scsize,cachesize,p,w" > $outf
+fi
+
+for (( i=0; i < $iterations; i++ )); do
+    for (( n=1; n <= $core_ct; n+=n )); do
+        for (( padding=0; padding <= max_padding; padding+=32 )); do
+            loop_body
+        done
+    done 
+    if (( n > $core_ct && n < 2*$core_ct )); then # handle cases where core_ct isn't 2^k
+        n=$core_ct
+        for (( padding=0; padding <= max_padding; padding+=32 )); do
+            loop_body
+        done
+    fi
+done

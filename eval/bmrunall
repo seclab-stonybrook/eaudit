@@ -1,0 +1,28 @@
+#!/bin/bash
+
+if (( $# < 1 || $# > 4 )); then
+    echo "Usage: $0 <datafilename> [per_cpu_buffer [wakeup_interval [max_padding]]]" && exit 1
+fi
+
+outfile="$1"
+per_cpu_buffer=$2
+wakeup_interval=$3
+max_padding=${4:-0}
+
+if [[ "${outfile##*.}" != "csv" ]]; then
+    echo "data file name should have a csv suffix" && exit 1
+fi
+
+if [[ -f $outfile ]]; then
+    echo "refusing to overwrite an existing data file" && exit 1
+fi
+
+./bmrun $outfile run_find 288 $max_padding $per_cpu_buffer $wakeup_interval
+./bmrun $outfile run_tar 144 $max_padding $per_cpu_buffer $wakeup_interval
+./bmrun $outfile run_shbm 200000 $max_padding $per_cpu_buffer $wakeup_interval
+./bmrun $outfile run_rdwr 100000000 $max_padding $per_cpu_buffer $wakeup_interval
+./bmrun $outfile "run_pm pm-config.sm" 24 $max_padding $per_cpu_buffer $wakeup_interval
+./bmrun $outfile run_httperf 3000 $max_padding $per_cpu_buffer $wakeup_interval
+./bmrun $outfile run_kernbuild 1 $max_padding $per_cpu_buffer $wakeup_interval
+
+

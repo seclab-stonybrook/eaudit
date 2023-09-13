@@ -1,0 +1,100 @@
+#!/bin/bash
+
+#******************************************************************************
+# Copyright 2022-23 Hanke Kimm and Secure Systems Lab, Stony Brook University
+#******************************************************************************
+# This file is part of eAudit. This specific script was used in part to produce
+# the results in Section 4.5 of the eAudit paper (IEEE S&P, 2024).
+#
+# eAudit is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# eAudit is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+# A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# eAudit. If not, see <https://www.gnu.org/licenses/>.
+#****************************************************************************
+
+if (( $# !=10 )); then
+    echo "Usage: $0 <bmark> <number_of_parallel_tasks> <loop_ct> <conf_file> <core_ct> <rbuf_sz> <avg_syscall_sz> <wakeup_int> <trial_loops> <data_file>"
+    exit
+fi 
+
+bmark=$1
+task_ct=$2
+loop_ct=$3
+conf_file=$4
+core_ct=$5
+rbuf_sz=$6
+avg_syscall_ct=$7
+wakeup_int=$8
+trial_loops=$9
+data_file=${10}
+
+do_script() {
+    ag_user_time_total=0
+    ag_sys_time_total=0
+    bmark_real_time_total=0
+    bmark_user_time_total=0
+    bmark_sys_time_total=0
+
+    for (( loop=0; loop<$trial_loops; loop++ )); do
+
+        (cd ../..
+        sudo EAUDIT_SO="./ecapd.so" EAUDIT_UID=65534 EAUDIT_GID=65534 time python3 eauditd.py -s -v2 -b 2.0 -r 16 -w 8 -c /tmp/foo.log &> /tmp/log_tamp.txt &
+        echo "Sleeping for 15 seconds before starting benchmark..."
+        sleep 15
+        cd eval
+
+	if [[ $bmark == "./run_pm" ]]; then
+            $bmark $conf_file $task_ct $loop_ct
+        elif [[ $bmark == "./run_kernbuild" ]]; then
+            $bmark $task_ct
+    	else
+            $bmark $task_ct $loop_ct
+    	fi
+
+        sleep 10
+        sudo kill $(pidof python3)
+        sleep 5) &> /tmp/log_tamp2.txt
+        
+        syscall_avg_sz=`egrep -o "call=([0-9]+)" /tmp/log_tamp.txt | awk '{print $2}' FS='='`
+        msg_avg_sz=`egrep -o "record=([0-9]+)" /tmp/log_tamp.txt | awk '{print $2}' FS='='`
+
+        rbuf_calls=`grep ringbuf /tmp/log_tamp.txt | awk '{print $1}' FS=' '`
+        wakeup_wout=`egrep -o "[0-9]+ without" /tmp/log_tamp.txt | awk '{print $1}' FS=' '`
+        wakeup_actual=`egrep -o "[0-9]+ actual" /tmp/log_tamp.txt | awk '{print $1}' FS=' '`
+
+        read_amt=`egrep "lost" /tmp/log_tamp.txt`
+
+        regex="^(.+)[A-Za-z]+ Calls, ([0-9]+[.][0-9]+)([A-Za-z]+)"
+        if [[ $read_amt =~ $regex ]]; then
+            syscall_ct="${BASH_REMATCH[1]}"
+        fi
+
+    done
+
+    cd ../..
+    (sudo ./eaudit -I /tmp/foo.log) &> /tmp/windows.txt
+    cd eval/log_tamper
+
+    l_tamp=`egrep -o "[0-9]*[.]*[0-9]* syscalls" /tmp/windows.txt | awk '{print $1}' FS=' '`
+    crit_l_tamp=`egrep -o "[0-9]*[.]*[0-9]+ critical" /tmp/windows.txt | awk '{print $1}' FS=' '`
+    imp_l_tamp=`egrep -o "[0-9]*[.]*[0-9]+ important" /tmp/windows.txt | awk '{print $1}' FS=' '`
+    windows=`egrep -o "Windows: [0-9]+" /tmp/windows.txt | awk '{print $2}' FS=': '`
+
+    echo "***Window Count=$windows***"
+    echo "***normal events=$l_tamp, critical events=$crit_l_tamp, important events=$imp_l_tamp***"  
+    echo $l_tamp,$crit_l_tamp,$imp_l_tamp,$windows,$syscall_ct,$core_ct,$rbuf_sz,$avg_syscall_ct >> $data_file
+}
+
+if [ -f "${10}" ]; then
+    do_script $p_val $wakeup_int $latency $calc_norm_lat $calc_crit_lat $calc_imp_lat $data_file
+else
+    echo l_tamp,crit_l_tamp,imp_l_tamp,windows,total_records,core_ct,rbuf_sz,avg_syscall_ct >> $data_file
+    do_script $p_val $wakeup_int $latency $calc_norm_lat $calc_crit_lat $calc_imp_lat $data_file
+fi

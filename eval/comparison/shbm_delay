@@ -1,0 +1,33 @@
+#!/bin/bash
+if [[ -z "${SLEEPTIME}" ]]; then
+    SLEEP_TIME=0
+else
+    SLEEP_TIME=${SLEEPTIME}
+fi
+
+SKIP_INDEX=$3
+SLEEP_INTERVAL=$(($1/$SKIP_INDEX))
+
+echo "Sleep Time is" $SLEEP_TIME "Seconds"
+
+helper() {
+      ECHO_INDEX=0
+      for (( i=0; i<SLEEP_INTERVAL; i++)); do
+          sleep $SLEEP_TIME
+          for (( j=1; j<SKIP_INDEX; j++ )); do
+              /bin/echo $j
+          done
+      done | wc
+}
+
+if (( $# != 3 )); then
+    echo "Usage: $0 <loop_count> <number_of_parallel_tasks> <execs_per_sleep>"
+    exit
+fi
+
+time (
+    for (( nproc=0; nproc<$2; nproc++ )); do
+        (helper) &
+    done
+    wait
+)

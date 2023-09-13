@@ -1,0 +1,16 @@
+This directory contains the original postmark benchmark, as well as a version
+we modified to insert delays. The top-level script is runpm, which can run
+one or more instances of postmark in parallel. Each instance will use a 
+dedicated subdirectory to operate, as this allows for increased parallelism.
+The size of the workload and other details are specified in the config files
+that are named pm-config.{nano,micro,sm,reg}. The suffixes are indicative of
+the length of time that the benchmark will take to complete.
+
+Note that postmark with delays introduced is meant for serial rather than
+parallel operation, and is not supported by runpm. This is because that version
+is intended for evaluating audit collection systems that are unable to cope
+with even a single instance of postmark.
+
+Before running the scripts, you need to compile using the makefile. Note that
+postmark uses a very old dialect of C, and will hence produce many warning
+messages. 

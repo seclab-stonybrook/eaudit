@@ -1,0 +1,22 @@
+#!/bin/bash
+
+#******************************************************************************
+# Copyright 2022-23 Hanke Kimm and Secure Systems Lab, Stony Brook University
+#******************************************************************************
+# This file is part of eAudit. This specific configuration file was used in 
+# part to produce the results in Section 4 of the eAudit paper (IEEE S&P, 2024).
+#
+# eAudit is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# eAudit is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+# A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# eAudit. If not, see <https://www.gnu.org/licenses/>.
+#****************************************************************************
+
+sudo ./tracee-ebpf --trace event=open,openat,creat,close,dup,dup2,dup3,pipe,socketpair,pipe2,read,readv,recvmsg,recvmmsg,pread64,preadv,recvfrom,getpeername,accept,accept4,connect,bind,sendto,write,writev,sendmsg,sendmmsg,pwrite64,pwritev,truncate,ftruncate,mmap,mprotect,unlink,unlinkat,mkdir,mkdirat,rmdir,chdir,fchdir,link,linkat,symlink,symlinkat,rename,renameat,renameat2,kill,tkill,tgkill,ptrace,chmod,fchmod,fchmodat,setresuid,setreuid,setuid,setresgid,setregid,setgid,fork,vfork,clone,clone3,execve,execveat,exit,exit_group,finit_module,init_module,mknod,mknodat,setfsgid,setfsuid,socket,splice,tee,vmsplice > /tmp/tracee.log

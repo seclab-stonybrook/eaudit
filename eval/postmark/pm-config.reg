@@ -1,0 +1,4 @@
+set number 4500
+set transactions 1500000
+set size 4096 102400
+set subdirectories 10

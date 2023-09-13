@@ -1,0 +1,8 @@
+sysdig-capture --> A script that runs sysdig in "capture mode".
+This is a mode that makes sysdig produce a binary trace file.
+
+sysdig-capture --> A script that runs sysdig in "print mode".
+This is a mode that makes sysdig print system call events to
+console.
+
+Both scripts capture the same syscalls the eAudit captures.

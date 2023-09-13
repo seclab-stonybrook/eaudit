@@ -1,0 +1,225 @@
+#!/bin/bash
+
+#******************************************************************************
+# Copyright 2022-23 Hanke Kimm and Secure Systems Lab, Stony Brook University
+#******************************************************************************
+# This file is part of eAudit. This specific script was used in part to produce
+# the results in Section 3.6 of the eAudit paper (IEEE S&P, 2024).
+#
+# eAudit is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# eAudit is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+# A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# eAudit. If not, see <https://www.gnu.org/licenses/>.
+#****************************************************************************
+
+if (( $# !=9 )); then
+    echo "Usage: $0 <bmark> <loop_count> <read_size> <number_of_parallel_tasks> <core_ct> <rbuf_sz> <avg_syscall_sz> <trial_loops> <csv_file_rel_name>"
+    exit
+fi 
+
+bmark=$1
+loop_ct=$2
+read_size=$3
+task_ct=$4
+core_ct=$5
+rbuf_sz=$6
+avg_syscall_ct=$7
+trial_loops=$8
+
+dryrun() {
+    echo "Starting Dry Run..."
+    (if [[ $bmark == "./wrbomb" ]]; then
+        $bmark $loop_ct $read_size $task_ct
+    else
+        $bmark $read_size $task_ct
+    fi
+    ) &> /tmp/latency.txt
+
+    echo "Sleeping for 5 seconds before starting script..."
+    sleep 5
+
+    base_bmark_rl_time=`grep real /tmp/latency.txt | awk 'NR==1 {print $2}' | awk '{print (($1 * 60) + $2)}' FS='m'`;
+    base_bmark_user_time=`grep user /tmp/latency.txt | awk 'NR==1 {print $2}' | awk '{print (($1 * 60) + $2)}' FS='m'`;
+    base_bmark_sys_time=`grep sys /tmp/latency.txt | awk 'NR==1 {print $2}' | awk '{print (($1 * 60) + $2)}' FS='m'`;
+    
+    cd ..
+    sudo EAUDIT_SO="./ecapd.so" EAUDIT_UID=65534 EAUDIT_GID=65534 time python3 eauditd.py -c /tmp/foo.log -s -v2 &> /tmp/latency.txt &
+    sleep 15
+    sudo kill $(pidof python3)
+    sleep 5
+    cd scripts
+    
+    base_agent_user_time=`grep user /tmp/latency.txt | awk '{print $1}' FS='user'`;
+    base_agent_sys_time=`grep user /tmp/latency.txt | awk '{print $2}' FS=' ' | awk '{print $1}' FS='system'`;
+}
+
+gather_time() {
+    ag_user_time_total=0
+    ag_sys_time_total=0
+
+    echo "Calculating t_b..."
+
+    for (( loop=0; loop<5; loop++ )); do
+        cd ..
+        echo "Performing trial loop $loop..."
+        sudo EAUDIT_SO="./ecapd.so" EAUDIT_UID=65534 EAUDIT_GID=65534 time python3 eauditd.py -s -v2 -b 11 -r 16 -w 256 -c /tmp/foo.log &> /tmp/latency.txt &
+        echo "Sleeping for 15 seconds before starting benchmark..."
+        sleep 15
+        cd scripts
+        if [[ $bmark == "./wrbomb" ]]; then
+            $bmark $loop_ct $read_size $task_ct
+        else
+            $bmark $read_size $task_ct
+        fi
+        sleep 15
+        sudo kill $(pidof python3)
+        echo "Sleeping for 15 seconds before re-starting benchmark..."
+        sleep 15
+
+        agent_user_time=`grep user /tmp/latency.txt | awk '{print $1}' FS='user'`;
+        agent_sys_time=`grep user /tmp/latency.txt | awk '{print $2}' FS=' ' | awk '{print $1}' FS='system'`;
+        ag_user_time_total=`echo $ag_user_time_total + $agent_user_time | bc`
+        ag_sys_time_total=`echo $ag_sys_time_total + $agent_sys_time | bc`
+    done
+
+    avg_usr_ag_time=`echo "scale=4; $ag_user_time_total / 5" | bc`
+    avg_sys_ag_time=`echo "scale=4; $ag_sys_time_total / 5" | bc`
+    gather_time=`echo "scale=4; ($avg_usr_ag_time + $avg_sys_ag_time) - ($base_agent_user_time + $base_agent_sys_time)" | bc`
+
+    echo "t_b CPU time is $gather_time..."
+}
+
+do_script() {
+    ag_user_time_total=0
+    ag_sys_time_total=0
+    bmark_real_time_total=0
+    bmark_user_time_total=0
+    bmark_sys_time_total=0
+
+    b_val=`echo "scale=3; ($1 * $avg_syscall_ct)/1000" | bc`
+    echo "Using calculated per-CPU buf size of $b_val Kb"
+
+    for (( loop=0; loop<$trial_loops; loop++ )); do
+
+        (cd ..
+        sudo EAUDIT_SO="./ecapd.so" EAUDIT_UID=65534 EAUDIT_GID=65534 time python3 eauditd.py -s -v2 -b $b_val -r $rbuf_sz -w $2 -c /tmp/foo.log &> /tmp/latency.txt &
+        echo "Sleeping for 15 seconds before starting benchmark..."
+        sleep 15
+        cd scripts
+        if [[ $bmark == "./wrbomb" ]]; then
+            $bmark $loop_ct $read_size $task_ct
+        else
+            $bmark $read_size $task_ct
+        fi
+        sleep 15
+        sudo kill $(pidof python3)
+        echo "Sleeping for 15 seconds before re-starting benchmark..."
+	    sleep 15) &> /tmp/latency2.txt
+        
+        syscall_avg_sz=`egrep -o "call=([0-9]+)" /tmp/latency.txt | awk '{print $2}' FS='='`
+        msg_avg_sz=`egrep -o "record=([0-9]+)" /tmp/latency.txt | awk '{print $2}' FS='='`
+
+        syscall_per_msg=`echo "scale=4; $msg_avg_sz / $syscall_avg_sz" | bc`
+
+        lost_amt=`egrep -o "[(].+ lost[)]" /tmp/latency.txt`
+
+        loss_regex="[(]([0-9]+[.][0-9]+)[A-Za-z]+ lost[)]"
+        no_loss_regex="[(]([0-9]+) lost[)]"
+        if [[ $lost_amt =~ $loss_regex ]]; then
+            lost_amt="${BASH_REMATCH[1]}"
+        elif [[ $lost_amt =~ $no_loss_regex ]]; then
+            lost_amt="${BASH_REMATCH[1]}"
+        fi
+
+        read_amt=`egrep "lost" /tmp/latency.txt`
+
+        regex="^(.+)[A-Za-z]+ Calls, ([0-9]+[.][0-9]+)([A-Za-z]+)"
+        if [[ $read_amt =~ $regex ]]; then
+            syscall_ct="${BASH_REMATCH[1]}"
+            read_amt="${BASH_REMATCH[2]}"
+            unit="${BASH_REMATCH[3]}"
+            if [[ $unit == "GiB" ]]; then
+                read_amt=`echo "scale=4; $read_amt * 1000" | bc`
+            fi
+        fi
+
+        rbuf_calls=`grep ringbuf /tmp/latency.txt | awk '{print $1}' FS=' '`
+        wakeup_wout=`egrep -o "[0-9]+ without" /tmp/latency.txt | awk '{print $1}' FS=' '`
+        wakeup_actual=`egrep -o "[0-9]+ actual" /tmp/latency.txt | awk '{print $1}' FS=' '`
+
+        bmark_real_time=`grep real /tmp/latency2.txt | awk 'NR==1 {print $2}' | awk '{print (($1 * 60) + $2)}' FS='m'`;
+        bmark_user_time=`grep user /tmp/latency2.txt | awk 'NR==1 {print $2}' | awk '{print (($1 * 60) + $2)}' FS='m'`;
+        bmark_sys_time=`grep sys /tmp/latency2.txt | awk 'NR==1 {print $2}' | awk '{print (($1 * 60) + $2)}' FS='m'`;
+
+        agent_user_time=`grep user /tmp/latency.txt | awk '{print $1}' FS='user'`;
+        agent_sys_time=`grep user /tmp/latency.txt | awk '{print $2}' FS=' ' | awk '{print $1}' FS='system'`;
+
+	    echo "agent user time="$agent_user_time, "agent sys time="$agent_sys_time
+
+        ag_user_time_total=`echo $ag_user_time_total + $agent_user_time | bc`
+        ag_sys_time_total=`echo $ag_sys_time_total + $agent_sys_time | bc`
+        bmark_real_time_total=`echo $bmark_real_time_total + $bmark_real_time | bc`
+        bmark_user_time_total=`echo $bmark_user_time_total + $bmark_user_time | bc`
+        bmark_sys_time_total=`echo $bmark_sys_time_total + $bmark_sys_time | bc`
+
+    done
+
+    avg_usr_ag_time=`echo "scale=4; $ag_user_time_total / $trial_loops" | bc`
+    avg_sys_ag_time=`echo "scale=4; $ag_sys_time_total / $trial_loops" | bc`
+    avg_real_bmark_time=`echo "scale=4; $bmark_real_time_total / $trial_loops" | bc`
+    avg_user_bmark_time=`echo "scale=4; $bmark_user_time_total / $trial_loops" | bc`
+    avg_sys_bmark_time=`echo "scale=4; $bmark_sys_time_total / $trial_loops" | bc`
+
+    total_ag_cpu_time=`echo "scale=4; ($avg_usr_ag_time + $avg_sys_ag_time) - ($base_agent_user_time + $base_agent_sys_time)" | bc`
+
+    #getting regression values
+    total_msgs=`echo "scale=4; $rbuf_calls + $wakeup_wout" | bc`
+    t_q_per_syscall=`echo "scale=8; ($total_msgs) / ($syscall_ct * 1000000)" | bc`
+    t_s_per_syscall=`echo "scale=8; ($wakeup_actual) / ($syscall_ct * 1000000)" | bc`
+
+    #calculating overhead
+    wall_clock_ohead=`echo "scale=4; (($avg_real_bmark_time - $base_bmark_rl_time) / $base_bmark_rl_time) * 100" | bc`
+    agent_ohead=`echo "scale=4; ($total_ag_cpu_time / ($base_bmark_user_time + $base_bmark_sys_time))" | bc`
+    buffer_ag_time=`echo "scale=4; $total_ag_cpu_time - $gather_time" | bc`
+    buffer_ohead=`echo "scale=8; (($total_ag_cpu_time - $gather_time) / ($base_bmark_user_time + $base_bmark_sys_time))" | bc`
+
+    #getting "actual values"
+    p_act=`echo "scale=8; ($syscall_ct * 1000000) / ($rbuf_calls + $wakeup_wout)" | bc`
+    w_act=`echo "scale=8; ($rbuf_calls + $wakeup_wout) / $wakeup_actual" | bc`
+    l_1=`echo "scale=8; (1 / $wakeup_actual)" | bc`
+    l_2=`echo "scale=8; $core_ct / ($rbuf_calls + $wakeup_wout)" | bc`
+    l_act=`echo "scale=8; ($syscall_ct * 1000000) * ($l_2 + $l_1)" | bc`
+
+    echo "***p_act=$p_act, p_req=$1, w_act=$w_act, w_req=$2, l_act=$l_act, l_req=$3***" 
+
+    avg_latency=$(($3/2))
+    echo "***Inserting data of wakeup time=$2, max latency=$3 calls, avg latency=$avg_latency calls***" 
+    echo $3,$l_act,$wall_clock_ohead,$agent_ohead,$avg_real_bmark_time,$avg_user_bmark_time,$avg_sys_bmark_time,$base_bmark_rl_time,$base_bmark_user_time,$base_bmark_sys_time,$total_ag_cpu_time,$avg_usr_ag_time,$avg_sys_ag_time,$base_agent_user_time,$base_agent_sys_time,$gather_time,$buffer_ag_time,$buffer_ohead,$1,$p_act,$2,$w_act,$t_q_per_syscall,$t_s_per_syscall,$rbuf_calls,$wakeup_wout,$wakeup_actual,$total_msgs,$read_amt,$lost_amt,$syscall_ct,$core_ct,$rbuf_sz,$avg_syscall_ct >> $4
+}
+
+dryrun
+gather_time
+
+latency_fac=(15 25 50 100 200 400)
+wakeup_int=(1 2 4 8 10 16 32)
+for lf in ${latency_fac[@]}; do
+    latency=$((lf*$core_ct))
+    for w in ${wakeup_int[@]}; do
+        p_val=`echo "scale=4; $latency / ($core_ct + $w - 1)" | bc`
+        csv_file="$9$w.csv"
+        echo "Using p-val of $p_val from latency of $latency and w value of $w..."
+        if [ -f "$csv_file" ]; then
+            do_script $p_val $w $latency $csv_file
+        else
+            echo latency_req,latency_act,wall_clk_ohead,agent_ohead,bmark_wall_time,bmark_user_time,bmark_sys_time,base_bmark_wall_time,base_bmark_user_time,base_bmark_sys_time,total_ag_time,agent_usr,agent_sys,base_agent_usr,base_agent_sys,t_b,o_ag_time,o_act,p_val_req,p_val_act,w_val_req,w_val_act,t_q_per_syscall,t_s_per_syscall,rbuf_with_f,rbuff_wout_f,actual_wakes,total_msgs,read_rec_sz,lost_rec_sz,total_recs,core_ct,rbuf_sz,avg_syscall_ct >> $csv_file
+            do_script $p_val $w $latency $csv_file
+        fi
+    done
+done

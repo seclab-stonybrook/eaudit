@@ -1,0 +1,15 @@
+#!/bin/bash
+
+if (( $# !=1 )); then
+    echo "Usage: $0 <buffer_ratio>"
+    exit
+fi
+
+buf_ratio=$1
+
+sudo sysdig -r /var/tmp/sysdig.cap > /var/tmp/sysdig-tmp.log
+
+total_rec_ct=`egrep "\([0-9]+\) >" /var/tmp/sysdig-tmp.log | wc -l`
+log_tamp=`echo "scale=4; $total_rec_ct * $buf_ratio" | bc`
+
+echo "***tamper window=$log_tamp***"

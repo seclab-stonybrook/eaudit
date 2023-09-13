@@ -1,0 +1,24 @@
+#!/bin/bash
+
+if (( $# != 2 )); then
+    echo "Usage: $0 <number_of_parallel_tasks> <loop_count>"
+    exit
+fi
+
+tasks=$1
+iter=$2
+
+cd rdwr
+make all
+
+helper() {
+   ./twrite $2 1 < ./rdwr_data/in$1 > ./rdwr_data/out$1
+}
+
+time ( 
+    for (( i=0; i<$tasks; i++ )); do
+        (helper $i $iter) &
+    done
+    wait 
+)
+

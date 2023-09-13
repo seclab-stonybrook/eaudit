@@ -1,0 +1,9 @@
+#!/bin/bash
+# It would be great if you can compile without root privilege, but the
+# toolchain is so broken that it dumps a ton of errors on correct programs.
+
+wrapper=sudo
+if (( `id -u` == 0 )); then
+    wrapper=
+fi
+$wrapper time python3 eauditd.py "$@"
