@@ -1,4 +1,0 @@
-set number 150
-set transactions 10000
-set size 2048 32768
-set subdirectories 10
