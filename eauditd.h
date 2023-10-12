@@ -1,5 +1,5 @@
 //cpp header file to declare classes and functions
-//the logic is, we are only decalring one function
+//the logic is, we are only declaring one function
 //to create logs. Python will only call this. Internally
 //in the implementation, we'd use the recordString argument
 //of this function to initialize auditconsumer, and call
