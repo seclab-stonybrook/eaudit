@@ -61,6 +61,17 @@ a human readable format. Being based on **ebpf**, **ecapd** requires root privil
 run. Both programs support a **-h** option that prints a help message documenting the
 command-line options.
 
+## Prevention and Detection Modes
+
+The current release supports two operating modes for tamper-window experiments:
+
+* **prevention** is the default mode. The logger records audit data without
+  enabling tamper-detection signing. Scripts pass this mode by using the
+  argument `prevention`.
+* **detection** enables tamper-detection support. The scripts pass `-H` to
+  **ecapd** and parse the resulting log with `eaudit -L -V`, so the parser
+  validates the additional detection metadata.
+
 ## Behind the scene
 
 **ecapd**  is a wrapper shell script that invokes **eauditd.py**,
