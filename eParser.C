@@ -1,21 +1,3 @@
-/*******************************************************************************
- *  Copyright 2022-23 R. Sekar and Secure Systems Lab, Stony Brook University
- *******************************************************************************
- * This file is part of eAudit.
- *
- * eAudit is free software: you can redistribute it and/or modify it under the
- * terms of the GNU General Public License as published by the Free Software
- * Foundation, either version 3 of the License, or (at your option) any later
- * version.
- *
- * eAudit is distributed in the hope that it will be useful, but WITHOUT ANY
- * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
- * A PARTICULAR PURPOSE. See the GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * eAudit. If not, see <https://www.gnu.org/licenses/>.
- ******************************************************************************/
-
 #include <string.h>
 #include <numeric>
 #include <stdint.h>
@@ -38,26 +20,33 @@
 
 #include "eauditk.h"
 #include "eParser.h"
+#include "eConsumer.h"
+#include "prthelper.h"
+#include "ePrinter.h"
+#include "eRecorder.h"
 
+#include "computehash.h"
+
+#include "keygen.h"
 using namespace std;
 
 const char* scname[256];
-static FILE *ofp;
 enum ScType {SC_DEFAULT, SC_IMPORTANT, SC_CRITICAL};
 ScType cur_sctype;
 
-uint64_t max_kernel_ts_clk_kernel_diff;
-uint64_t clk_real, clk_kernel; // If synchronization records report both times,
-                            // we use these vars; otherwise use just the next var
 uint64_t clk_kernel_diff;   // REAL - MONOTONIC clock
 uint64_t kernel_ts_msb;     // Just the MS bits from the last Time record
 uint64_t kernel_ts;         // The full time stamp for the last record.
 uint64_t clk_ts;            // Real time computed from kernel time
 
+uint64_t tamperwin_start;   // as per MONOTONIC clock.
+
 long entry_rec, exit_rec, tsms_rec, tsms_rec1, tsdiff_rec, err_rec;
 long exit_errs, trunc_fn, trunc_data;
 long sc_count[256], scexit_count[256];
-bool exit_op, no_ts, no_entry;
+bool exit_op, no_entry;
+bool force_ts=true; // forces timestamps for all records. Almost all syscalls
+// are NOT split, so no gain here but only complication.
 long skipped;
 long nr;
 int tid, pid, last_tid, last_pid;
@@ -69,20 +58,27 @@ uint64_t tamper_totclag, tamper_totilag, tamper_totlag;
 uint64_t tamper_thisclag, tamper_thisilag, tamper_thislag;
 uint64_t tamper_maxclag, tamper_maxilag, tamper_maxlag;
 long tamper_windows;
-LongHistogram tamperclag, tamperilag, tamperlag;
+LongHistogram tamperclag, tamperilag, tamperlag, tamper_period;
 
-const int PBUFSIZE = 1024*8*6;
+EConsumer *eConsumer;
+
+// BUFSIZE is the maximum possible record size, per eauditk.h
+const int PBUFSIZE = 8*BUFSIZE; 
 char *buf = new char[PBUFSIZE];
+const char* rbuf = buf;
 
 const char *current_rec;
 size_t offset;
 uint64_t n_out_of_order, t_out_of_order;
-
-bool print_log, useseqnum, useprocid;
 unsigned sn, procid;
-
+bool log_tampered = false;
+int n_tampered_events;
+bool initial_seed_embedded = false;
+int verifier_batch_count = 0;    // tracks how many seed batches have been embedded
+unsigned char (*verifier_signing_keys_lo)[SIGNING_KEY_SIZE]; // lower half of verifier signing key ring
+unsigned char (*verifier_signing_keys_hi)[SIGNING_KEY_SIZE]; // upper half [SIGNING_KEY_BATCH_SIZE..SIGNING_KEY_RING_SIZE-1]
 /**********************************************************************************
- * Some printing and helper functions
+ * Some error-printing and helper functions
  *********************************************************************************/
 
 const char* errcode[] = {
@@ -218,93 +214,13 @@ const char* errcode[] = {
 /*ecode[131] =*/ "ENOTRECOVERABLE"
 };
 
-string 
-countReadable(long count, int w) {
-   char ss[21];
-   if (count/1000000000>=1) sprintf(ss,"%.*f%s", w, count/1000000000.0, "B");
-   else if (count/1000000>=1) sprintf(ss,"%.*f%s", w, count/1000000.0, "M");
-   else if (count/1000>=1) sprintf(ss,"%.*f%s", w, count/1000.0, "K");
-   else sprintf(ss,"%ld", count);
-   return string(ss);
-}
-
-string 
-countReadable(long c) {
-   return countReadable(c, 1);
-}
-
-void prtSortedCounts(long count[], const char* const name[], unsigned sz, 
-                     const char* title, const char* hdg, int width, FILE* fp) {
-   vector<unsigned> idx(sz);
-   unsigned cols = width/8;
-   unsigned i;
-
-   if (hdg) {
-      char s[width+1];
-      strncpy(s, hdg, width);
-      s[width] = '\0';
-      int l = strlen(s);
-      int p = (width - l)/2;
-      if (l < width-2) {
-         for (int j=1; j < p; j++)
-            fputc('*', fp);
-         fputc(' ', fp);
-      }
-      fprintf(fp, "%s", s);
-      if (l < width-2) {
-         fputc(' ', fp);
-         if (l+2*p < width) p++;
-         for (int j=1; j < p; j++)
-            fputc('*', fp);
-      }
-      fputc('\n', fp);
-   }
-
-   iota(idx.begin(), idx.end(), 0);
-   sort(idx.begin(), idx.end(),
-        [&](unsigned i, unsigned j) { 
-           return (count[i] > count[j] || (count[i] == count[j] && i < j)); });
-
-   unsigned nz=sz; unsigned c=0;
-   for (; nz > 0; nz--)
-      if (count[idx[nz-1]])
-         break;
-
-   for (unsigned j=0; j < nz;) {
-      fprintf(fp, "%6s: ", title);
-      c=1; 
-      for (i=j; i < nz; i++) {
-         char s[8];
-         if (name[idx[i]]) {
-            strncpy(s, name[idx[i]], sizeof(s));
-            s[7] = '\0';
-         }
-         else sprintf(s, "#%d", idx[i]);
-         fprintf(fp, "%7s ", s);
-         if (++c == cols) break;
-      }
-      fprintf(fp, "\n");
-      fprintf(fp, "%6s: ", "Count");
-      c=1;
-      for (i=j; i < nz; i++) {
-         fprintf(fp, "%7s ", countReadable(count[idx[i]], 1).c_str());
-         if (++c == cols) break;
-      }
-      fprintf(fp, "\n");
-      j=i+1; c=0;
-   }
-   if (c != 0) 
-      fprintf(fp, "\n");
-}
-
-
-static void 
+static void
 errexit(const char* msg, const char* buf=0, size_t len=0) {
    if (!buf)
       perror(msg);
    else {
       fprintf(stderr, "%s: '", msg);
-      for (unsigned i=0; i < len; i++) 
+      for (unsigned i=0; i < len; i++)
          if (isascii(buf[i]))
             fputc(buf[i], stderr);
          else fprintf(stderr, "\\x%x", buf[i]);
@@ -313,567 +229,81 @@ errexit(const char* msg, const char* buf=0, size_t len=0) {
    exit(1);
 }
 
-static void 
+FILE *pofp, *cofp;
+bool use_seqnum = true;
+extern bool use_procid, prt_musec_ts, prtInParser, verifyLog;
+
+static void
 errmsg(const char* msg, const char *p, const char *q) {
-   fflush(ofp);
-   fprintf(stderr, "***** %s: at offset %ld:\n", msg, offset+(current_rec-buf));
+   fflush(pofp);
+   fprintf(stderr, "***** %s: at or near offset %ld:\n",
+      msg, offset+(current_rec-rbuf));
    fwrite(current_rec, p-current_rec, 1, stderr);
    fprintf(stderr, "\n**** Text following error is: ");
    fwrite(p, min(32l, q-p), 1, stderr);
    fprintf(stderr, "\n *******************************************\n");
 }
 
-static inline char
-hexdigit(char c) {
-   if (0 <= c && c < 10)
-      return '0'+c;
-   else return 'a' + (c-10);
+static void
+prt_ts_and_pid() {
+   // @@@@ About 70% of the runtime for printing is from just the next line!
+   //fprintf(pofp, "%ld: pid=%d: ", ts, pid);
+   prttspid(clk_ts, pid, sn, procid, use_seqnum, use_procid, prt_musec_ts, pofp);
+   if (tid != pid)
+      fprintf(pofp, "tid=%u: ", tid);
 }
 
 static void
-bin2str(FILE* fp, const char* path, size_t len) {
-   for (unsigned j=0; j <len; j++)
-      if (isascii(path[j]))
-         fputc(path[j], fp);
-      else 
-         fprintf(fp, "\\x%c%c", hexdigit((path[j]>>4)&0xf), hexdigit(path[j]&0xf));
-}
-
-static void 
 init_scname() {
-   scname[ACCEPT_EN] = scname[ACCEPT_EX] = "accept";
-   scname[BIND_EN] = scname[BIND_EX] = "bind";
-   scname[CHDIR_EN] = scname[CHDIR_EX] = "chdir";
-   scname[CHMOD_EN] = scname[CHMOD_EX] = "chmod";
+   scname[ACCEPT_EX] = "accept";
+   scname[BIND_EX] = "bind";
+   scname[CHDIR_EX] = "chdir";
+   scname[CHMOD_EX] = "chmod";
    scname[CLONE_EN] = scname[CLONE_EX] = "clone";
-   scname[CLOSE_EN] = scname[CLOSE_EX] = "close";
-   scname[CONNECT_EN] = scname[CONNECT_EX] = "connect";
+   scname[CLOSE_EN] = "close";
+   scname[CONNECT_EX] = "connect";
    scname[DUP_EX] = "dup";
    scname[DUP2_EX] = "dup2";
    scname[EXECVE_EN] = scname[EXECVE_EX] = scname[EXECVEE_EN] = "execve";
    scname[EXIT_EN] = "exit";
    scname[EXITGRP_EN] = "exitgrp";
-   scname[FCHDIR_EN] = scname[FCHDIR_EX] = "fchdir";
-   scname[FCHMOD_EN] = scname[FCHMOD_EX] = "fchmod";
+   scname[ERR_REP] = "argerr"; // Lookup of saved arg frm sc entry failed at exit
+   scname[FCHDIR_EX] = "fchdir";
+   scname[FCHMOD_EX] = "fchmod";
    scname[FORK_EN] = scname[FORK_EX] = "fork";
-   scname[FTRUNC_EN] = scname[FTRUNC_EX] = "ftruncate";
-   scname[GETPEER_EN] = scname[GETPEER_EX] = "getpeername";
+   scname[FTRUNC_EX] = "ftruncate";
+   scname[GETPEER_EX] = "getpeername";
    scname[KILL_EN] = scname[KILL_EX] = "kill";
-   scname[LINK_EN] = scname[LINK_EX] = "link";
-   scname[MKDIR_EN] = scname[MKDIR_EX] = "mkdir";
-   scname[MMAP_EN] = scname[MMAP_EX] = "mmap";
-   scname[MPROTECT_EN] = scname[MPROTECT_EX] = "mprotect";
-   scname[OPEN_EN] = scname[OPEN_EX] = "open";
-   scname[PIPE_EN] = scname[PIPE_EX] = "pipe";
-   scname[PREAD_EN] = scname[PREAD_EX] = "pread";
+   scname[LINK_EX] = "link";
+   scname[MKDIR_EX] = "mkdir";
+   scname[MMAP_EX] = "mmap";
+   scname[MPROTECT_EX] = "mprotect";
+   scname[OPEN_EX] = "open";
+   scname[PREAD_EX] = "pread";
    scname[PTRACE_EN] = scname[PTRACE_EX] = "ptrace";
-   scname[PWRITE_EN] = scname[PWRITE_EX] = "pwrite";
-   scname[READ_EN] = scname[READ_EX] = "read";
-   scname[RECVFROM_EN] = scname[RECVFROM_EX] = "recvfrom";
-   scname[RENAME_EN] = scname[RENAME_EX] = "rename";
-   scname[RMDIR_EN] = scname[RMDIR_EX] = "rmdir";
-   scname[SENDTO_EN] = scname[SENDTO_EX] = "sendto";
-   scname[SETGID_EN] = scname[SETGID_EX] = "setgid";
-   scname[SETUID_EN] = scname[SETUID_EX] = "setuid";
-   scname[SOCKPAIR_EN] = scname[SOCKPAIR_EX] = "socketpair";
-   scname[SYMLINK_EN] = scname[SYMLINK_EX] = "symlink";
-   scname[TRUNC_EN] = scname[TRUNC_EX] = "truncate";
-   scname[UNLINK_EN] = scname[UNLINK_EX] = "unlink";
-   scname[WRITE_EN] = scname[WRITE_EX] = "write";
-   scname[MKNOD_EN] = scname[MKNOD_EX] = "mknod";
-   scname[FI_MODULE_EN] = scname[FI_MODULE_EX] = "finit_module" ;
-   scname[I_MODULE_EN] = scname[I_MODULE_EX] = "init_module";
-   scname[SPLICE_EN] = scname[SPLICE_EX]  = "splice";
-   scname[VMSPLICE_EN] = scname[VMSPLICE_EX] = "vmsplice";
-   scname[TEE_EN] = scname[TEE_EX] = "tee";
-   scname[SOCKET_EN] = scname[SOCKET_EX] = "socket";
+   scname[PWRITE_EX] = "pwrite";
+   scname[READ_EX] = "read";
+   scname[RECVFROM_EX] = "recvfrom";
+   scname[RENAME_EX] = "rename";
+   scname[RMDIR_EX] = "rmdir";
+   scname[SENDTO_EX] = "sendto";
+   scname[SETGID_EX] = "setgid";
+   scname[SETUID_EX] = "setuid";
+   scname[SYMLINK_EX] = "symlink";
+   scname[TRUNC_EX] = "truncate";
+   scname[UNLINK_EX] = "unlink";
+   scname[WRITE_EX] = "write";
+   scname[MKNOD_EX] = "mknod";
+   scname[FINITMOD_EX] = "finit_module" ;
+   scname[INITMOD_EX] = "init_module";
+   scname[VMSPLICE_EX] = "vmsplice";
+   scname[CHOWN_EX] = "chown";
+   scname[FCHOWN_EX] = "fchown";
+   scname[LCHOWN_EX] = "lchown";
+   scname[MOUNT_EX] = "mount";
+   scname[UMOUNT_EX] = "umount";
 }
 
-/******************************************************************************
-* Printing-related helper functions.                                          *
-******************************************************************************/
-
-static void 
-prttspid(uint64_t ts, int p, uint16_t sn, uint8_t procid) {
-   static uint64_t last_ts;
-
-   static char c[64];
-   int j=63;
-   static int ts_idx;
-   const int pid_idx=47;
-   if (useseqnum)
-      ts = ts/1000000;
-   else ts = ts/10000;
-
-   if (pid == last_tid) 
-      j = pid_idx;
-   else {
-      c[--j] = '\0';
-      c[--j] = ' ';
-      c[--j] = ':';
-      while (p > 0) {
-         unsigned x = p % 10;
-         p = p/10;
-         c[--j] = x + '0';
-      }
-      c[--j] = '=';
-      c[--j] = 'd';
-      c[--j] = 'i';
-      c[--j] = 'p';
-      while (j > pid_idx+1)
-         c[--j] = ' ';
-      c[--j] = ':';
-   }
-
-   if (useseqnum) {
-      unsigned x = sn % 10;
-      sn = sn/10;
-      c[--j] = x + '0';
-      x = sn % 10;
-      sn = sn/10;
-      c[--j] = x + '0';
-      x = sn % 10;
-      sn = sn/10;
-      c[--j] = x + '0';
-      x = sn % 10;
-      sn = sn/10;
-      c[--j] = x + '0';
-      x = sn;
-      c[--j] = x + '0';
-      c[--j] = ':';
-   }
-
-   if (useprocid) {
-      c[--j] = hexdigit(procid&0xf);
-      c[--j] = hexdigit((procid>>4)&0xf);
-      c[--j] = ':';
-   }
-
-   if (ts == last_ts) 
-      j = ts_idx;
-   else {
-      last_ts = ts;
-      int l=0;
-      while (ts > 0) {
-         unsigned x = ts % 10;
-         ts = ts/10;
-         c[--j] = x + '0';
-         if (useseqnum) {
-            if (++l == 3)
-               c[--j] = '.';
-         }
-         else if (++l == 5)
-            c[--j] = '.';
-      }
-      c[--j] = '\n';
-      ts_idx = j;
-   }
-   fputs(&c[ts_idx], ofp);
-}
-
-// %%%% Most overhead in eParse comes from printing --- 80% or more. It used to 
-// %%%% be more like 95%, then a few heavy hitters --- just a few lines of code
-// %%%% altogether --- were hand-tweaked to improve performance by more than 2x.
-// %%%% There is still scope for improvement, but the easy stuff is done.
-
-static void
-prt_ts_and_pid() {
-   // @@@@ About 70% of the runtime for printing is from just the next line!
-   //fprintf(ofp, "%ld: pid=%d: ", ts, pid);
-   prttspid(clk_ts, pid, sn, procid);
-   if (tid != pid)
-      fprintf(ofp, "tid=%u: ", tid);
-}
-
-static void
-prt_open(long fd, const char* fn, long fl, long md, long ret) {
-   if (fd != AT_FDCWD)
-      fprintf(ofp, "open(at=%lu, file=\"%s\", flags=%lx, mode=%#lo) ret=%ld", 
-              fd, fn, fl, md, ret);
-   else fprintf(ofp, "open(file=\"%s\", flags=%lx, mode=%#lo) ret=%ld", 
-                fn, fl, md, ret);
-}
-
-static void
-prt_ret(uint8_t sc, long ret) {
-   if (pid != last_pid || tid != last_tid)
-      fprintf(ofp, "%s ret=%ld", scname[sc], ret);
-   else fprintf(ofp, " ret=%ld", ret);
-}
-
-static void
-prt_exitids(uint8_t sc, long ret, int uid, int gid, long cgroup) {
-   if (pid != last_pid || tid != last_tid)
-      fprintf(ofp, "%s ret=%ld uid=%d gid=%d cgroup=%ld", 
-              scname[sc], ret, uid, gid, cgroup);
-   else fprintf(ofp, " ret=%ld uid=%d gid=%d cgroup=%ld", 
-              ret, uid, gid, cgroup);
-}
-
-static void
-prt_dup(char sc, long fd, long ret) {
-   fprintf(ofp, "%s(fd=%ld) ret=%ld", scname[(unsigned)sc], fd, ret);
-}
-
-static void
-prt_fchdir(long fd) {
-   fprintf(ofp, "fchdir(fd=%lu)", fd);
-}
-
-static void
-prt_fchmod(long fd, long mode) {
-   fprintf(ofp, "fchmod(fd=%lu, mode=%#lo)", fd, mode);
-}
-
-static void
-prt_read(long fd, long ret) {
-   fprintf(ofp, "read(fd=%lu) ret=%ld", fd, ret);
-}
-
-static void
-prt_write(long fd, long ret) {
-   fprintf(ofp, "write(fd=%lu) ret=%ld", fd, ret);
-}
-
-static void
-prt_close(long fd, long unrep_rd, long unrep_wr) {
-   if (unrep_rd) {
-      prt_read(fd, unrep_rd);
-      prt_ts_and_pid();
-   }
-   if (unrep_wr) {
-      prt_write(fd, unrep_wr);
-      prt_ts_and_pid();
-   }
-   char c[32];
-   int j=32;
-   c[--j] = '\0';
-   c[--j] = ')';
-   while (fd > 0) {
-      unsigned x = fd % 10;
-      fd = fd/10;
-      c[--j] = x + '0';
-   }
-   fputs("close(fd=", ofp);
-   fputs(&c[j], ofp);
-}
-
-static void
-prt_pipe_spair(uint8_t sc, long ret) {
-   fputs(sc==PIPE_EX? "pipe" : "socketpair", ofp);
-   if (is_err(ret))
-      fprintf(ofp, "() ret=%ld", ret);
-   else fprintf(ofp, "() fd1=%d fd2=%d", (int)(ret&0xffffffff), (int)(ret>>32));
-}
-
-static void
-print_saddr(uint8_t *sa, uint64_t len) {
-   if (len < sizeof(sa_family_t)) {
-      fprintf(ofp, "invalid: ");
-      return;
-   }
-
-   // for (int j=0; j < len; j++)
-   //   fprintf(ofp, "%d.", sa[j]);
-   // fprintf(ofp, "\n");
-
-   saddr_t& saddr = *(saddr_t*)sa;
-   char s[128], pt[16];
-
-   switch (saddr.sun.sun_family) {
-   case AF_UNSPEC:
-      fprintf(ofp, "unspec:");
-      break;
-
-   case AF_LOCAL: {
-      const struct sockaddr_un& un = saddr.sun;
-      fprintf(ofp, "unix:");
-      if (len == sizeof(sa_family_t))
-         fprintf(ofp, "unnamed");
-      else if (un.sun_path[0] == '\0') {
-        // These are special endpoints that don't create a file.
-        // Don't ignore, thinking it is an (invalid) null string.
-        bin2str(ofp, un.sun_path, len-sizeof(sa_family_t));
-      }
-      else fprintf(ofp, "%s", (char*)un.sun_path);
-      //fputc(' ', ofp);
-      break;
-   }
-
-   case AF_INET: {
-      const struct sockaddr_in& in = saddr.sin;
-      unsigned ip = in.sin_addr.s_addr;
-      unsigned short port = ntohs(in.sin_port);
-      fprintf(ofp, "IP4:%d.%d.%d.%d:%d", ip&0xff, (ip>>8)&0xff, (ip>>16)&0xff,
-              ip>>24, port);
-      break;
-   }
-
-   case AF_NETLINK: {
-      const struct sockaddr_nl& nl = saddr.snl;
-      fprintf(ofp, "netlink:%d/%x", nl.nl_pid, nl.nl_groups);
-      break;
-   }
-
-   case AF_INET6: {
-      getnameinfo((struct sockaddr*)&saddr.sin6, sizeof(saddr.sin6), 
-                  s, sizeof(s), pt, sizeof(pt), NI_NUMERICHOST|NI_NUMERICSERV);
-      fprintf(ofp, "IP6:%s:%s", s, pt);
-      break;
-   }
-
-   default:
-      fprintf(ofp, "unsupported:");
-      break;
-   }
-}
-
-static void
-prt_saddr(uint8_t sc, long fd, long ret, uint8_t *saddr, unsigned slen)  {
-   fprintf(ofp, "%s(fd=%lu) ret=%ld", scname[sc], fd, ret);
-   if (slen > 0) {
-      fprintf(ofp, " endpoint=");
-      print_saddr(saddr, slen);
-   }
-}
-
-static void
-prt_connect(long fd, long ret, uint8_t *saddr, unsigned slen)  {
-   fprintf(ofp, "connect(fd=%lu, endpoint=", fd);
-   print_saddr(saddr, slen);
-   fprintf(ofp, ") ret=%ld", ret);
-}
-
-static void
-prt_bind(long fd, uint8_t *saddr, unsigned slen)  {
-   fprintf(ofp, "bind(fd=%lu, endpoint=", fd);
-   print_saddr(saddr, slen);
-   fputc(')', ofp);
-}
-
-static void
-prt_sendto(long fd, uint8_t *saddr, unsigned slen, long ret)  {
-   fprintf(ofp, "sendto(fd=%lu, endpoint=", fd);
-   print_saddr(saddr, slen);
-   fprintf(ofp, ") ret=%ld", ret);
-}
-
-static void
-prt_truncate(const char* fn, long len) {
-   fprintf(ofp, "truncate(file=\"%s\", len=%ld)", fn, len);
-}
-
-static void
-prt_ftruncate(long fd, long len) {
-   fprintf(ofp, "ftruncate(fd=%lu, len=%ld)", fd, len);
-}
-
-static void
-prt_mmap(long addr, long len, int prot, long flags) {
-      fprintf(ofp, "mmap(addr=%lx, len=%ld, prot=%d, flags=%lx)", 
-              addr, len, prot, flags);
-}
-
-static void
-prt_mmap_ret(long fd, long ret) {
-   if (pid != last_pid || tid != last_tid)
-      fprintf(ofp, "mmap fd=%ld ret=%lx", fd, ret);
-   else fprintf(ofp, " fd=%ld ret=%lx", fd, ret);
-}
-
-static void
-prt_mprotect(long addr, long len, long prot, long ret) {
-   fprintf(ofp, "mprotect(addr=%lx, len=%ld, prot=%lx) ret=%ld", 
-           addr, len, prot, ret);
-}
-
-static void
-prt_unlink(long fd, const char* fn) {
-   fprintf(ofp, "unlink(");
-   if (fd != AT_FDCWD)
-      fprintf(ofp, "at=%lu, ", fd);
-   fprintf(ofp, "file=\"%s\")", fn);
-}
-
-static void
-prt_mkdir(long fd, const char *fn, long mode) {
-   fprintf(ofp, "mkdir(");
-   if (fd != AT_FDCWD)
-      fprintf(ofp, "at=%lu, ", fd);
-   fprintf(ofp, "file=\"%s\", mode=%#lo)", fn, mode);
-}
-//Added to print mknod 
-static void
-prt_mknod(long fd, const char *fn, long mode, long dev) {
-   //fprintf(ofp,"file descriptor-test: %ld", fd);
-   fprintf(ofp, "mknod(");
-   if (fd != AT_FDCWD)
-      fprintf(ofp, "at=%lu, ", fd);
-   fprintf(ofp, "file=\"%s\", mode=%#lo, dev=%ld)", fn, mode, dev);
-}
-static void 
-prt_chmod(long fd, const char *fn, long mode) {
-   fprintf(ofp, "chmod(");
-   if (fd != AT_FDCWD)
-      fprintf(ofp, "at=%lu, ", fd);
-   fprintf(ofp, "file=\"%s\", mode=%#lo)", fn, mode);
-}
-
-static void
-prt_rmdir(const char* fn) {
-   fprintf(ofp, "rmdir(file=\"%s\")", fn);
-}
-
-static void
-prt_chdir(const char *fn) {
-   fprintf(ofp, "chdir(file=\"%s\")", fn);
-}
-
-static void
-prt_link(long fd1, long fd2, const char *s1, const char *s2, long flags) {
-   fprintf(ofp, "link(");
-   if (fd1 != AT_FDCWD || fd2 != AT_FDCWD)
-      fprintf(ofp, "src=\"%s\", at=%lu, dst=\"%s\", at=%lu, flags=%lx)", 
-              s1, fd1, s2, fd2, flags);
-   else fprintf(ofp, "src=\"%s\", dst=\"%s\")", s1, s2);
-}
-
-static void
-prt_rename(long fd1, long fd2, const char *s1, const char *s2, long flags) {
-   fprintf(ofp, "rename(");
-   if (fd1 != AT_FDCWD || fd2 != AT_FDCWD)
-      fprintf(ofp, "src=\"%s\", at=%lu, dst=\"%s\", at=%lu", 
-              s1, fd1, s2, fd2);
-   else fprintf(ofp, "src=\"%s\", dst=\"%s\"", s1, s2);
-   if (flags != 0) fprintf(ofp, ", flags=%lx", flags);
-   fprintf(ofp, ")");
-}
-
-static void
-prt_symlink(long fd, const char *s1, const char *s2) {
-   fprintf(ofp, "symlink(src=\"%s\", dst=\"%s\"", s1, s2);
-   if (fd != AT_FDCWD)
-      fprintf(ofp, ", at=%lu", fd);
-   fprintf(ofp, ")");
-}
-
-static void
-prt_kill(int pid, int tid, int sig) {
-   if (pid == tid) 
-      fprintf(ofp, "kill(pid=%d, sig=%d)", pid, sig);
-   else if (pid == 0)
-      fprintf(ofp, "kill(tid=%d, sig=%d)", tid, sig);
-   else fprintf(ofp, "kill(pid=%d, tid=%d, sig=%d)", pid, tid, sig);
-}
-
-static void
-prt_ptrace(int pid, long req) {
-   fprintf(ofp, "ptrace(req=%lx, pid=%d)", req, pid);
-}
-
-static void
-prt_setuid(int euid, int ruid, int suid) {
-   fprintf(ofp, "setuid(euid=%d", euid);
-   if (ruid != -1)
-      fprintf(ofp, ", ruid=%d", ruid);
-   if (suid != -1)
-      fprintf(ofp, ", suid=%d", suid);
-   fprintf(ofp, ")");
-}
-
-static void
-prt_setgid(int egid, int rgid, int sgid)  {
-   fprintf(ofp, "setgid(egid=%d", egid);
-   if (rgid != -1)
-      fprintf(ofp, ", rgid=%d", rgid);
-   if (sgid != -1)
-      fprintf(ofp, ", sgid=%d", sgid);
-   fprintf(ofp, ")");
-}
-
-static void
-prt_fork() {
-   fprintf(ofp, "fork()");
-}
-
-static void
-prt_clone(long flags) {
-   fprintf(ofp, "clone(flags=%lx)", flags);
-}
-
-static void
-prt_execve(long fd, long fl, const char *fn, const char *args, const char *envs) {
-   if (fd == AT_FDCWD && fl == 0)
-      fprintf(ofp, "execve(file=\"%s\", ", fn);
-   else fprintf(ofp, "execve(at=%lu, flags=%lx, file=\"%s\", ", fd, fl, fn);
-   
-   fprintf(ofp, "argv=%s env=%s", args, envs);
-   fprintf(ofp, ")");
-}
-
-static void
-prt_exit(long flags) {
-   fprintf(ofp, "exit(code=%lx)", flags);
-}
-
-static void
-prt_exitgrp(long flags) {
-   fprintf(ofp, "exitgrp(code=%lx)", flags);
-}
-
-static void
-prt_finit_module(const char * usr_args, long fd, long flags){
-   fprintf(ofp, "finit_module(");
-   fprintf(ofp, "fd=%lu, ", fd);
-   fprintf(ofp, "uargs=\"%s\", flags=%lx", usr_args, flags);
-   fprintf(ofp, ")");
-
-}
-
-static void
-prt_init_module(const char * usr_args, const char *data, long slen ){
-   fprintf(ofp,"init_module(");
-   if(slen > 0)
-   fprintf(ofp,"umode=\"%s\",",data);
-   fprintf(ofp," uargs=%s",usr_args);
-   fprintf(ofp, ")");
-}
-
-static void
-prt_splice(long off_in, long off_out, long dlen, int fd_in,
-           int fd_out, int flags){
-   fprintf(ofp, "splice(");
-   fprintf(ofp, "len=%lu, fd_in=%d, fd_out=%d, flags=%d", 
-                                       dlen, fd_in, fd_out, flags);
-   fprintf(ofp, ")");
-
-}
-
-static void
-prt_vmsplice( long fd, long flags){
-   fprintf(ofp,"vmsplice(");
-   fprintf(ofp,"fd=%lo,",fd);
-   fprintf(ofp," flags=%lo", flags);
-   fprintf(ofp, ")");
-}
-
-static void
-prt_tee(long fd_in, long fd_out,long dlen, int flags){
-   fprintf(ofp, "tee(");
-    fprintf(ofp, "len=\"%lu\", fd_in=%lu, fd_out=%lu, flags=%d)", 
-                                       dlen, fd_in, fd_out, flags);
-   fprintf(ofp, ")");
-
-}
-//Added to print for socket syscalls 
-static void
-prt_socket(long family, long type, long protocol){
-   fprintf(ofp, "socket(");
-   fprintf(ofp, "Family=%lu, ", family);
-   fprintf(ofp, "Type=%lu, prot=%lu", type, protocol);
-   fprintf(ofp, ")");
-
-}
 /**********************************************************************************
  * Helper functions to parse record fields
  *********************************************************************************/
@@ -903,48 +333,44 @@ get_long(const char*& p, const char* q, int width, long& v) {
 ******************************************************************************/
 static bool
 get_ts_and_widths(const char*& p, const char* q) {
-   if (exit_op && no_ts) { // No timestamp to read
-      if (p+1 >= q) return false;
-   }
-   else {         // Read and process timestamp
-      if (p+5 >= q) return false;
+   // Read and process timestamp
+   if (p+5 >= q) return false;
 
-      uint64_t last_kernel_ts = kernel_ts;
+   uint64_t last_kernel_ts = kernel_ts;
 #ifdef FULL_TIME
-      kernel_ts = *(const uint64_t*)p; p+= 8;
-      uint64_t ts_lsb = LS_BITS(kernel_ts);
-      if (kernel_ts != kernel_ts_msb + ts_lsb)
-         fprintf(stderr, "diff: %ld\n", (long)(kernel_ts - kernel_ts_msb - ts_lsb));
+   kernel_ts = *(const uint64_t*)p; p+= 8;
+   //uint64_t ts_lsb = LS_BITS(kernel_ts);
+   //if (kernel_ts != kernel_ts_msb + ts_lsb)
+     // fprintf(stderr, "diff: %ld\n", (long)(kernel_ts - kernel_ts_msb - ts_lsb));
 #else
-      uint32_t ts_lsb = *(const int*)p; p+= 3;
-      ts_lsb = LS_BITS(ts_lsb);
-      kernel_ts = kernel_ts_msb + ts_lsb;
+   uint32_t ts_lsb = *(const int*)p; p+= 3;
+   ts_lsb = LS_BITS(ts_lsb);
+   kernel_ts = kernel_ts_msb + ts_lsb;
 #endif
-      if (kernel_ts < clk_kernel) {
-         max_kernel_ts_clk_kernel_diff = max(max_kernel_ts_clk_kernel_diff, clk_kernel-kernel_ts);
-         if (cur_sctype == SC_CRITICAL) {
-            tamper_ccount++;
-            tamper_thisclag = max(tamper_thisclag, clk_kernel - kernel_ts);
-            tamper_maxclag = max(tamper_maxclag, clk_kernel - kernel_ts);
-         }
-         else if (cur_sctype == SC_IMPORTANT) {
-            tamper_icount++;
-            tamper_thisilag = max(tamper_thisilag, clk_kernel - kernel_ts);
-            tamper_maxilag = max(tamper_maxilag, clk_kernel - kernel_ts);
-         }
-         tamper_count++;
-         tamper_thislag = max(tamper_thislag, clk_kernel - kernel_ts);
-         tamper_maxlag = max(tamper_maxlag, clk_kernel - kernel_ts);
+   if (kernel_ts + 1000 < tamperwin_start) {
+      if (cur_sctype == SC_CRITICAL) {
+         tamper_ccount++;
+         tamper_thisclag = max(tamper_thisclag, tamperwin_start - kernel_ts);
+         tamper_maxclag = max(tamper_maxclag, tamperwin_start - kernel_ts);
       }
-      clk_ts = kernel_ts + clk_kernel_diff;
-      if (kernel_ts < last_kernel_ts) {
-         uint64_t backdrift = (last_kernel_ts - kernel_ts);
-         if (backdrift > 1e10) 
-            fprintf(stderr, "Backdrift by %g seconds\n", backdrift/1e9);
-         if (backdrift < 1e11) {
-            n_out_of_order++;
-            t_out_of_order += backdrift;
-         }
+      else if (cur_sctype == SC_IMPORTANT) {
+         tamper_icount++;
+         tamper_thisilag = max(tamper_thisilag, tamperwin_start - kernel_ts);
+         tamper_maxilag = max(tamper_maxilag, tamperwin_start - kernel_ts);
+      }
+      tamper_count++;
+      tamper_thislag = max(tamper_thislag, tamperwin_start - kernel_ts);
+      tamper_maxlag = max(tamper_maxlag, tamperwin_start - kernel_ts);
+   }
+   clk_ts = kernel_ts + clk_kernel_diff;
+   if (kernel_ts < last_kernel_ts) {
+      uint64_t backdrift = (last_kernel_ts - kernel_ts);
+      if (backdrift > 1e10 /*&& entry_rec+exit_rec > 500*/)
+         fprintf(stderr, "Backdrift by %g seconds after %ld records\n", 
+                 backdrift/1e9, entry_rec+exit_rec);
+      if (backdrift < 1e11) {
+         n_out_of_order++;
+         t_out_of_order += backdrift;
       }
    }
 
@@ -958,19 +384,29 @@ get_ts_and_widths(const char*& p, const char* q) {
    if (!get_long(p, q, pid_width, pid_tgid))
       return false;
 
-   last_pid = pid; 
+   last_pid = pid;
    last_tid = tid;
-   if (pid_width <= 4) 
+   if (pid_width <= 4)
       pid = tid = (int)pid_tgid;
    else {
       pid = pid_tgid >> 32;
       tid = pid_tgid & ((1ul << 32)-1);
    }
 
-   if (print_log) {
-      if (no_entry || !exit_op || pid != last_pid || tid != last_tid)
+   if (prtInParser) {
+      if (!exit_op || no_entry || force_ts || pid!=last_pid || tid!=last_tid)
          prt_ts_and_pid();
    }
+   return true;
+}
+
+static bool
+get_long_ex(long& a1, const char*& p, const char* q) {
+   if (p + 8 >= q) {
+      return false;
+   }
+   a1 = *(const uint64_t*)p;
+   p += 8;
    return true;
 }
 
@@ -996,10 +432,20 @@ get_long3(long& a1, long& a2, long& a3, const char*& p, const char* q) {
 }
 
 static bool
-get_long3int(long& a1, long& a2, long& a3, int& a4, const char*& p, const char* q) {
-   if (!get_long3(a1, a2, a3, p, q)) return false;
-   if (p+4 >= q) return false;
-   a4 = *(int*)p; p+= 4;
+get_long4(long& a1, long& a2, long& a3, long& a4, const char*& p, const char* q) {
+   if (!get_long2(a1, a2, p, q)) return false;
+   if (!get_long(p, q, a3width, a3)) return false;
+   if (!get_long_ex(a4, p, q)) return false;
+   return true;
+}
+
+static bool
+get_long5(long& a1, long& a2, long& a3, long& a4, long& a5, 
+      const char*& p, const char* q) {
+   if (!get_long2(a1, a2, p, q)) return false;
+   if (!get_long(p, q, a3width, a3)) return false;
+   if (!get_long_ex(a4, p, q)) return false;
+   if (!get_long_ex(a5, p, q)) return false;
    return true;
 }
 
@@ -1019,6 +465,15 @@ rem_spc_strbuf() {
 static inline char*
 get_strbuf() {
    return strbuf_next;
+}
+
+static inline char*
+copy2strbuf(const char* src, int len) {
+   char *rv = strbuf_next;
+   assert_abort(rem_spc_strbuf() > len);
+   memcpy(strbuf_next, src, len);
+   strbuf_next += len;
+   return rv;
 }
 
 static inline char*
@@ -1056,13 +511,6 @@ get_string(char*& s, const char*& p, const char* q, char term='\0') {
 }
 
 static bool
-get_str_long0(char*& s, const char*& p, const char* q) {
-   if (!get_ts_and_widths(p, q)) return false;
-   if (!get_string(s, p, q)) return false;
-   return true;
-}
-
-static bool
 get_str_long1(char*& s, long& a1, const char*& p, const char* q) {
    if (!get_long1(a1, p, q)) return false;
    if (!get_string(s, p, q)) return false;
@@ -1070,7 +518,7 @@ get_str_long1(char*& s, long& a1, const char*& p, const char* q) {
 }
 
 static bool
-get_str_long2(char*& s, long& a1, long& a2, 
+get_str_long2(char*& s, long& a1, long& a2,
                const char*& p, const char* q) {
    if (!get_long2(a1, a2, p, q)) return false;
    if (!get_string(s, p, q)) return false;
@@ -1078,7 +526,7 @@ get_str_long2(char*& s, long& a1, long& a2,
 }
 
 static bool
-get_str_long3(char*& s, long& a1, long& a2, long& a3, 
+get_str_long3(char*& s, long& a1, long& a2, long& a3,
                const char*& p, const char* q) {
    if (!get_long3(a1, a2, a3, p, q)) return false;
    if (!get_string(s, p, q)) return false;
@@ -1086,11 +534,21 @@ get_str_long3(char*& s, long& a1, long& a2, long& a3,
 }
 
 static bool
-get_str2_long1(char*& s1, char*& s2, long& a1,
+get_str_long4(char*& s, long& a1, long& a2, long& a3, long& a4,
                const char*& p, const char* q) {
-   if (!get_long1(a1, p, q)) return false;
-   if (!get_string(s1, p, q)) return false;
-   if (!get_string(s2, p, q)) return false;
+   if (!get_long3(a1, a2, a3, p, q)) return false;
+   if (!get_long_ex(a4, p, q)) return false;
+   if (!get_string(s, p, q)) return false;
+   return true;
+}
+
+static bool
+get_str_long5(char*& s, long& a1, long& a2, long& a3, long& a4, long& a5,
+               const char*& p, const char* q) {
+   if (!get_long3(a1, a2, a3, p, q)) return false;
+   if (!get_long_ex(a4, p, q)) return false;
+   if (!get_long_ex(a5, p, q)) return false;
+   if (!get_string(s, p, q)) return false;
    return true;
 }
 
@@ -1104,20 +562,37 @@ get_str2_long3(char*& s1, char*& s2, long& a1, long& a2, long &a3,
 }
 
 static bool
-get_data(uint8_t*& d, unsigned& dlen, const char*& p, const char* q) {
-   dlen = (uint8_t)*p;
-   d = (uint8_t*)++p; // skip length field
-   if (dlen > MAX_DLEN) trunc_data++;
-   if (p+dlen >= q) return false;
-   p += dlen;
+get_str2_long5(char*& s1, char*& s2, long& a1, long& a2, long &a3, long &a4,
+               long& a5, const char*& p, const char* q) {
+   if (!get_long3(a1, a2, a3, p, q)) return false;
+   if (!get_long_ex(a4, p, q)) return false;
+   if (!get_long_ex(a5, p, q)) return false;
+   if (!get_string(s1, p, q)) return false;
+   if (!get_string(s2, p, q)) return false;
    return true;
 }
 
 static bool
-get_data_long1(uint8_t*& d, unsigned& dlen, long& a1, const char*& p, 
-               const char* q) {
-   if (!get_long1(a1, p, q)) return false;
-   if (!get_data(d, dlen, p, q)) return false;
+get_str3_long2(char *&s1, char *&s2, char *&s3, long &a1, long &a2,
+                           const char *&p, const char *q) {
+  if (!get_long2(a1, a2, p, q))
+    return false;
+  if (!get_string(s1, p, q))
+    return false;
+  if (!get_string(s2, p, q))
+    return false;
+  if (!get_string(s3, p, q))
+    return false;
+  return true;
+}
+
+static bool
+get_data(uint8_t*& d, unsigned& dlen, const char*& p, const char* q) {
+   dlen = (uint8_t)*p; p++;
+   if (dlen > MAX_DLEN) trunc_data++;
+   if (p+dlen >= q) return false;
+   d = (uint8_t*)copy2strbuf(p, dlen);
+   p += dlen;
    return true;
 }
 
@@ -1129,6 +604,213 @@ get_data_long2(uint8_t*& d, unsigned& dlen, long& a1, long &a2,
    return true;
 }
 
+static bool
+get_data_long3(uint8_t*& d, unsigned& dlen, long& a1, long &a2, long &a3,
+               const char*& p, const char* q) {
+   if (!get_long3(a1, a2, a3, p, q)) return false;
+   if (!get_data(d, dlen, p, q)) return false;
+   return true;
+}
+
+static bool 
+get_binary(char*& d, unsigned& dlen, const char*& p, const char* q) {
+   if (p >= q) return false; 
+
+   dlen = (uint8_t)*p;  // Read the stored length
+   p++;  // Move past length field
+
+   if (dlen > MAX_DLEN) {
+      trunc_data++;  // Handle potential data truncation
+      return false;
+   }
+
+   if (p + dlen > q) return false; 
+
+   d = (char*)p; 
+   p += dlen;  
+
+   return true; 
+}
+
+
+static void 
+regenerate_signing_key_batch(unsigned char (*signing_key_batch_out)[SIGNING_KEY_SIZE], char *embedded_seed) {
+
+   unsigned char batch_seed[SIGNING_KEY_SIZE];
+   memcpy(batch_seed, embedded_seed, SIGNING_KEY_SIZE);
+#ifdef TAMPER_DETECT
+   generate_signing_keys(batch_seed, (unsigned char *)signing_key_batch_out);
+#endif
+   explicit_bzero(batch_seed, sizeof(batch_seed));
+}
+
+static inline bool
+consume_signing_key_seed(const char*& p, const char* q, char*& embedded_seed) {
+   unsigned slen = 0;
+   return get_binary(embedded_seed, slen, p, q);
+}
+
+static inline bool
+consume_signed_record_mac(const char*& p, const char* q, char*& mac_tag,
+                          unsigned& signed_payload_bytes) {
+   unsigned slen = 0;
+   char *mac_record = NULL;
+   if (!get_binary(mac_record, slen, p, q)) return false;
+   if (slen != SIGNED_RECORD_TRAILER_SIZE) return false;
+   signed_payload_bytes = ((uint8_t)mac_record[0]) |
+                          (((uint8_t)mac_record[1]) << 8);
+   mac_tag = mac_record + SIGNED_RECORD_LEN_SIZE;
+   return true;
+}
+
+static bool
+read_embedded_seed_and_mac(const char*& p, const char* q, char*& embedded_seed,
+                           char*& mac_tag, unsigned& signed_payload_bytes) {
+   embedded_seed = NULL;
+   mac_tag = NULL;
+   signed_payload_bytes = 0;
+   if (verifyLog) {
+      if (*p == SIGNING_KEY_SEED_REC) {
+         p++;
+         if (!consume_signing_key_seed(p, q, embedded_seed)) return false;
+
+         if (!initial_seed_embedded) {
+            // First seed: generate batch 0 into lower half of the verifier ring.
+            initial_seed_embedded = true;
+            regenerate_signing_key_batch(verifier_signing_keys_lo, embedded_seed);
+            verifier_batch_count = 1;
+         } else {
+            // Subsequent seeds regenerate the next batch into alternating halves.
+            if (verifier_batch_count % 2 == 1) {
+               regenerate_signing_key_batch(verifier_signing_keys_hi, embedded_seed);
+            } else {
+               regenerate_signing_key_batch(verifier_signing_keys_lo, embedded_seed);
+            }
+            verifier_batch_count++;
+         }
+      }
+
+      if (*p == SIGNED_RECORD_MAC_REC) {
+         p++;
+         if (!consume_signed_record_mac(p, q, mac_tag, signed_payload_bytes))
+            return false;
+      }
+   }
+   else {
+      if (*p == SIGNING_KEY_SEED_REC) {
+         p++;
+         if (!consume_signing_key_seed(p, q, embedded_seed)) return false;
+      }
+      if (*p == SIGNED_RECORD_MAC_REC) {
+         p++;
+         unsigned slen = 0;
+         if (!get_binary(mac_tag, slen, p, q)) return false;
+      }
+   }
+   return true;
+}
+
+unsigned char*
+get_signing_key_for_sn(uint32_t sn) {
+   // sn is already mod SIGNING_KEY_RING_SIZE (18-bit in record).
+   if (sn < SIGNING_KEY_BATCH_SIZE) {
+      return verifier_signing_keys_lo[sn];
+   } else {
+      return verifier_signing_keys_hi[sn - SIGNING_KEY_BATCH_SIZE];
+   }
+}
+
+static bool
+verify_record_mac(unsigned signed_payload_bytes, const char *signed_payload_end,
+                  const char *mac_tag) {
+   if (signed_payload_bytes == 0 ||
+       current_rec + signed_payload_bytes > signed_payload_end)
+      return false;
+
+   uint64_t computed_mac = 0;
+#ifdef TAMPER_DETECT
+   unsigned char *key = get_signing_key_for_sn(sn);
+   computed_mac = compute_umac3_mac((uint8_t*)current_rec, signed_payload_bytes,
+                                    (uint8_t*)key);
+#endif
+
+   uint64_t recorded_mac = 0;
+   memcpy(&recorded_mac, mac_tag, SIGNED_RECORD_MAC_SIZE);
+
+   if (computed_mac != recorded_mac)
+      return false;
+   return true;
+}
+
+static constexpr size_t VERIFIER_SIGNING_KEY_BATCH_BYTES =
+   SIGNING_KEY_BATCH_SIZE * SIGNING_KEY_SIZE;
+
+struct RecordCryptoFields {
+   char *embedded_seed = NULL;
+   char *mac_tag = NULL;
+   unsigned signed_payload_bytes = 0;
+   const char *signed_payload_end = NULL;
+};
+
+static bool
+read_record_crypto_fields(const char*& p, const char* q, RecordCryptoFields& crypto) {
+   crypto = RecordCryptoFields();
+   crypto.signed_payload_end = p;
+   return read_embedded_seed_and_mac(p, q, crypto.embedded_seed, crypto.mac_tag,
+                                     crypto.signed_payload_bytes);
+}
+
+static void
+mark_record_tampered(bool& is_tampered) {
+   log_tampered = true;
+   n_tampered_events += 1;
+   is_tampered = true;
+}
+
+static void
+verify_record_crypto_fields(const char*& p, const char* q,
+                            const RecordCryptoFields& crypto,
+                            bool& is_tampered) {
+   (void)p;
+   (void)q;
+   if (!verifyLog || crypto.mac_tag == NULL)
+      return;
+
+   if (!initial_seed_embedded)
+      return;
+
+   if (sn >= SIGNING_KEY_RING_SIZE)
+      return;
+
+   if (!verify_record_mac(crypto.signed_payload_bytes,
+                          crypto.signed_payload_end, crypto.mac_tag)) {
+      mark_record_tampered(is_tampered);
+   }
+}
+
+static bool
+allocate_verifier_signing_keys() {
+   verifier_signing_keys_lo = (unsigned char(*)[SIGNING_KEY_SIZE])
+      calloc(SIGNING_KEY_BATCH_SIZE, SIGNING_KEY_SIZE);
+   verifier_signing_keys_hi = (unsigned char(*)[SIGNING_KEY_SIZE])
+      calloc(SIGNING_KEY_BATCH_SIZE, SIGNING_KEY_SIZE);
+   return verifier_signing_keys_lo != NULL && verifier_signing_keys_hi != NULL;
+}
+
+static void
+clear_and_free_verifier_signing_keys(unsigned char (*&keys)[SIGNING_KEY_SIZE]) {
+   if (keys != NULL) {
+      explicit_bzero(keys, VERIFIER_SIGNING_KEY_BATCH_BYTES);
+      free(keys);
+      keys = NULL;
+   }
+}
+
+// %%%% Most overhead in eParse comes from printing --- 80% or more. It used to
+// %%%% be more like 95%, then a few heavy hitters --- just a few lines of code
+// %%%% altogether --- were hand-tweaked to improve performance by more than 2x.
+// %%%% There is still scope for improvement, but the easy stuff is done.
+
 /**********************************************************************************
  * Functions to parse syscalls and arguments
  *********************************************************************************/
@@ -1137,17 +819,25 @@ exit_open(const char*& p, const char* q) {
    char* fn;
    long md_fl;
    long at, fl, md;
+   long at_id, ret_id;
    long ret;
 
-   exit_op = true; no_ts = false; no_entry = true;
-   if (!get_str_long3(fn, md_fl, at, ret, p, q))
+   if (!get_str_long5(fn, md_fl, at, ret, at_id, ret_id, p, q))
       return false;
 
    md = md_fl >> 32;
    fl = md_fl & 0xffffffff;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log) 
-      prt_open(at, fn, fl, md, ret);
+   if (eConsumer)
+      eConsumer->openat(OPEN_EX, sn, clk_ts, tid, pid, at, fn, fl, md, ret,
+                        at_id, ret_id);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_open(at, fn, fl, md, ret, at_id, ret_id, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1158,14 +848,22 @@ exit_open(const char*& p, const char* q) {
 static bool
 exit_sc(uint8_t sc, const char*& p, const char* q) {
    long ret;
-   exit_op = true;
+   no_entry = false;
    if (!get_long1(ret, p, q))
       return false;
    if (is_err(ret)) exit_errs++;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   // Close return value is not important. Let us not wait for it.
-   if (print_log)
-      prt_ret(sc, ret);
+   if (eConsumer)
+      eConsumer->sc_exit(sc, sn, clk_ts, tid, pid, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_ret(scname[sc], ret, pid, tid, last_pid, last_tid, force_ts, pofp, 
+                     is_tampered);
+
    if (*p != '\n')
     errmsg("Missing newline", p, q);
    p++; // We include a newline at the end of records, skip it
@@ -1173,21 +871,23 @@ exit_sc(uint8_t sc, const char*& p, const char* q) {
 }
 
 static bool
-exitt_sc(uint8_t sc, const char*& p, const char* q) {
-   no_ts = false;
-   return exit_sc(sc, p, q);
-}
-
-static bool 
 enter_close(const char*& p, const char* q) {
-   long fd, unrep_read, unrep_write;
+   long fd, unrep_rd, unrep_wr;
 
-   if (!get_long3(fd, unrep_read, unrep_write, p, q))
+   exit_op = false;
+   if (!get_long3(fd, unrep_rd, unrep_wr, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   // Close return value is not important. Let us not wait for it.
-   if (print_log) {
-      prt_close(fd, unrep_read, unrep_write);
+   // Close return value is not important. Let us not wait for it (report 0)
+   if (eConsumer)
+      eConsumer->close(CLOSE_EN, sn, clk_ts, tid, pid, fd, unrep_rd, unrep_wr, 0);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser) {
+      prt_close(fd, unrep_rd, unrep_wr, pofp, is_tampered);
    }
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1195,16 +895,23 @@ enter_close(const char*& p, const char* q) {
    return true;
 }
 
-static bool 
+static bool
 exit_dup(char sc, const char*& p, const char* q) {
    long fd, ret;
 
-   exit_op = true; no_ts = false; no_entry = true;
    if (!get_long2(fd, ret, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_dup(sc, fd, ret);
+   if (eConsumer)
+      eConsumer->dup(sc, sn, clk_ts, tid, pid, fd, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_dup(scname[(unsigned)sc], fd, ret, pofp, is_tampered);
+
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // Skip the trailing newline character at the end of the record
@@ -1214,29 +921,44 @@ exit_dup(char sc, const char*& p, const char* q) {
 static bool
 exit_pipe(uint8_t sc, const char*& p, const char* q) {
    long ret;
-   exit_op = true; no_ts = false; no_entry = true;
    if (!get_long1(ret, p, q))
       return false;
    if (is_err(ret)) exit_errs++;
 
-   if (print_log)
-      prt_pipe_spair(sc, ret);
+   long fd1 = (int)ret;
+   long fd2 = (int)(ret>>32);
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   if (eConsumer)
+      eConsumer->pipe(sc, sn, clk_ts, tid, pid, sc==SOCKPAIR_EX, fd1, fd2);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_pipe_spair(sc, fd1, fd2, pofp, is_tampered);
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // We include a newline at the end of records, skip it
    return true;
 }
 
-static bool 
+static bool
 exit_read(const char*& p, const char* q) {
-   long fd, ret;
-   exit_op = true; no_ts = false; no_entry = true;
+   long fd, id, ret;
 
-   if (!get_long2(fd, ret, p, q))
+   if (!get_long3(fd, id, ret, p, q))
          return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log) 
-      prt_read(fd, ret);
+   if (eConsumer)
+      eConsumer->read(READ_EX, sn, clk_ts, tid, pid, fd, id, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_read(fd, id, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1246,17 +968,23 @@ exit_read(const char*& p, const char* q) {
 
 static bool
 exitt_saddr(uint8_t sc, const char*& p, const char* q) {
-   long ret, fd;
+   long ret, fd, id=0;
    uint8_t *saddr;
    unsigned slen=0;
 
-   exit_op = true; no_ts = false;  no_entry = true;
-   if (!get_data_long2(saddr, slen, fd, ret, p, q))
+   if (!get_data_long3(saddr, slen, fd, ret, id, p, q))
       return false;
    if (is_err(ret)) exit_errs++;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_saddr(sc, fd, ret, saddr, slen);
+   if (eConsumer)
+     eConsumer->accRcvfPeer(sc, sn, clk_ts, tid, pid, fd, id, saddr, slen, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+   
+   if (prtInParser)
+      prt_saddr(scname[sc], fd, id, ret, saddr, slen, pofp);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1264,54 +992,81 @@ exitt_saddr(uint8_t sc, const char*& p, const char* q) {
    return true;
 }
 
-static bool 
+static bool
 exit_connect(const char*& p, const char* q) {
-   long fd, ret;
+   long fd, id, ret;
    uint8_t* saddr;
    unsigned slen=0;
-   exit_op = true; no_ts = false; no_entry = true;
+
+   if (!get_data_long3(saddr, slen, fd, id, ret, p, q)) {
+      fprintf(stderr, "connect_ex error, dlen=%d, char=%c\n",
+         slen, (char)slen);
+      return false;
+   }
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   if (eConsumer)
+      eConsumer->connect(CONNECT_EX, sn, clk_ts, tid, pid, fd, id, saddr,
+         slen, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_connect(fd, id, ret, saddr, slen, pofp, is_tampered);
+
+   if (*p != '\n')
+      errmsg("Missing newline", p, q);
+   p++; // Skip the trailing newline character at the end of the record
+   return true;
+}
+
+static bool
+exit_bind(const char*& p, const char* q) {
+   long fd;
+   uint8_t* saddr;
+   long ret;
+   unsigned slen=0;
 
    if (!get_data_long2(saddr, slen, fd, ret, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log) 
-      prt_connect(fd, ret, saddr, slen);
+   if (eConsumer)
+       eConsumer->bind(BIND_EX, sn, clk_ts, tid, pid, fd, saddr,
+         slen, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
 
+   if (prtInParser)
+      prt_bind(fd, saddr, slen, ret, pofp, is_tampered);
+   
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // Skip the trailing newline character at the end of the record
    return true;
 }
 
-static bool 
-enter_bind(const char*& p, const char* q) {
-   long fd;
-   uint8_t* saddr;
-   unsigned slen=0;
-
-   if (!get_data_long1(saddr, slen, fd, p, q))
-      return false;
-
-  if (print_log) 
-      prt_bind(fd, saddr, slen);
-   if (*p != '\n')
-      errmsg("Missing newline", p, q);
-   p++; // Skip the trailing newline character at the end of the record
-   return true;
-}
-
-static bool 
+static bool
 exit_sendto(const char*& p, const char* q) {
    long fd, ret;
    uint8_t* saddr;
    unsigned slen=0;
-   exit_op = true; no_ts = false; no_entry = true;
 
    if (!get_data_long2(saddr, slen, fd, ret, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-  if (print_log) 
-      prt_sendto(fd, saddr, slen, ret);
+   if (eConsumer)
+      eConsumer->sendto(SENDTO_EX, sn, clk_ts, tid, pid, fd,
+         saddr, slen, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_sendto(fd, saddr, slen, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1319,16 +1074,22 @@ exit_sendto(const char*& p, const char* q) {
    return true;
 }
 
-static bool 
+static bool
 exit_write(const char*& p, const char* q) {
-   long fd, ret;
+   long fd, id, ret;
 
-   exit_op = true; no_ts = false; no_entry = true;
-   if (!get_long2(fd, ret, p, q))
+   if (!get_long3(fd, id, ret, p, q))
          return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log) 
-      prt_write(fd, ret);
+   if (eConsumer)
+      eConsumer->write(WRITE_EX, sn, clk_ts, tid, pid, fd, id, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_write(fd, id, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1336,16 +1097,23 @@ exit_write(const char*& p, const char* q) {
    return true;
 }
 
-static bool 
-enter_truncate(const char*& p, const char* q) {
+static bool
+exit_truncate(const char*& p, const char* q) {
    char* fn;
    long len;
-
-   if (!get_str_long1(fn, len, p, q))
+   long ret;
+   if (!get_str_long2(fn, len, ret, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_truncate(fn, len);
+   if (eConsumer)
+       eConsumer->truncate(TRUNC_EX, sn, clk_ts, tid, pid, fn, len, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_truncate(fn, len, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1353,38 +1121,25 @@ enter_truncate(const char*& p, const char* q) {
    return true;
 }
 
-static bool 
-enter_ftruncate(const char*& p, const char* q) {
-   long len, fd;
+static bool
+exit_ftruncate(const char*& p, const char* q) {
+   long len, id, fd, ret;
 
-   if (!get_long2(fd, len, p, q))
+   if (!get_long3(id, len, ret, p, q))
       return false;
 
-   if (print_log)
-      prt_ftruncate(fd, len);
+   fd = ret >> 1;
+   ret = (ret & 0x1)? -1 : 0;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+   
+   if (eConsumer)
+      eConsumer->ftruncate(FTRUNC_EX, sn, clk_ts, tid, pid, fd, id, len, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
 
-   if (*p != '\n')
-      errmsg("Missing newline", p, q);
-   p++; // Skip the trailing newline character at the end of the record
-   return true;
-}
-
-static bool 
-enter_mmap(const char*& p, const char* q) {
-   long addr, len;
-   long flags;
-   long prot;
-
-   // Uncomment the next line *if* LOG_MMAPALL is *NOT* enabled in the log
-   //cur_sctype = SC_IMPORTANT;
-   if (!get_long3(addr, len, flags, p, q))
-      return false;
-
-   prot = flags & 0x7;
-   flags = (((uint64_t)flags) >> 32);
-
-   if (print_log)
-      prt_mmap(addr, len, prot, flags);
+   if (prtInParser)
+      prt_ftruncate(fd, id, len, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1394,54 +1149,76 @@ enter_mmap(const char*& p, const char* q) {
 
 static bool
 exit_mmap(const char*& p, const char* q) {
-   long fd, ret;
-   exit_op = true;
-   if (!get_long2(fd, ret, p, q))
+   long id, addr, len, flags, ret;
+   int prot;
+   // Uncomment the next line *if* LOG_MMAPALL is *NOT* enabled in the log
+   cur_sctype = SC_IMPORTANT;
+   if (!get_long5(id, addr, len, flags, ret, p, q))
       return false;
    if (is_err(ret)) exit_errs++;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_mmap_ret(fd, ret);
+   prot = flags & 0x7;
+   flags = (((uint64_t)flags) >> 32);
+
+   if (eConsumer)
+      eConsumer->mmapex(MMAP_EX, sn, clk_ts, tid, pid, id, 
+                      addr, len, prot, flags, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_mmap(addr, len, prot, flags, id, ret, pofp, is_tampered);
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // We include a newline at the end of records, skip it
    return true;
 }
 
-static bool 
+static bool
+error_entry(const char*& p, const char* q) {
+   long errcode, sc;
+   last_tid = 0; // Force a new record, if printing.
+   if (!get_long2(errcode, sc, p, q))
+      return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_error_entry(errcode, sc, pofp);
+   if (*p != '\n')
+      errmsg("Missing newline", p, q);
+   p++; // We include a newline at the end of records, skip it
+   tid = 0; // Force the next record to be new, if printing
+   return true;
+}
+
+static bool
 exit_mprotect(const char*& p, const char* q) {
    long addr, len, prot, ret;
 
    // Uncomment the next line *if* LOG_MMAPALL is *NOT* enabled in the log
-   //cur_sctype = SC_IMPORTANT;
+   cur_sctype = SC_IMPORTANT;
 
-   exit_op = true; no_ts = false; no_entry = true;
    if (!get_long3(addr, len, ret, p, q))
       return false;
 
-   prot = ret >> 32;
-   ret = ((int)(ret & 0xffffffff));
+   prot = ((int)(ret & 0xffffffff));
+   ret = ret >> 32;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_mprotect(addr, len, prot, ret);
+   if (eConsumer)
+      eConsumer->mprotect(MPROTECT_EX, sn, clk_ts, tid, pid, addr, len, prot, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
 
-   if (*p != '\n')
-      errmsg("Missing newline", p, q);
-   p++; // Skip the trailing newline character at the end of the record
-   return true;
-}
-
-static bool 
-enter_unlink(const char*& p, const char* q) {
-   char* fn;
-   long fd;
-
-   cur_sctype = SC_IMPORTANT;
-   if (!get_str_long1(fn, fd, p, q))
-      return false;
-
-   if (print_log) 
-      prt_unlink(fd, fn);
+   if (prtInParser)
+      prt_mprotect(addr, len, prot, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1449,68 +1226,26 @@ enter_unlink(const char*& p, const char* q) {
    return true;
 }
 
-static bool 
-enter_mkdir(const char*& p, const char* q) {
-   char* fn;
-   long fd, mode;
-
-   if (!get_str_long2(fn, fd, mode, p, q))
-      return false;
-
-   if (print_log) 
-      prt_mkdir(fd, fn, mode);
-
-   if (*p != '\n')
-      errmsg("Missing newline", p, q);
-   p++; // Skip the trailing newline character at the end of the record
-   return true;
-}
-/*******************************************************************************
- * Code added for adding Parser for mknod syscall*
- * *****************************************************************************/
 static bool
-enter_mknod(const char*& p, const char* q) {
+exit_unlink(const char*& p, const char* q) {
    char* fn;
-   long fd, mode, dev;
-
-   if (!get_str_long3(fn, fd, mode, dev, p, q))
-      return false;
-
-   if (print_log) 
-      prt_mknod(fd, fn, mode, dev);
-
-   if (*p != '\n')
-      errmsg("Missing newline", p, q);
-   p++; // Skip the trailing newline character at the end of the record
-   return true;
-}
-
-static bool 
-enter_rmdir(const char*& p, const char* q) {
-   char* fn;
-
-   if (!get_str_long0(fn, p, q))
-      return false;
-
-  if (print_log)
-      prt_rmdir(fn);
-
-   if (*p != '\n')
-      errmsg("Missing newline", p, q);
-   p++; // Skip the trailing newline character at the end of the record
-   return true;
-}
-
-static bool 
-enter_chdir(const char*& p, const char* q) {
-   char* fn;
-
+   long fd, id;
+   long ret;
    cur_sctype = SC_IMPORTANT;
-   if (!get_str_long0(fn, p, q))
+
+   if (!get_str_long3(fn, fd, id, ret, p, q))
       return false;
 
-   if (print_log)
-      prt_chdir(fn);
+   fd = (int)fd;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+   if (eConsumer)
+      eConsumer->unlinkat(UNLINK_EX, sn, clk_ts, tid, pid, fd, id, fn, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_unlink(fd, id, fn, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1518,166 +1253,386 @@ enter_chdir(const char*& p, const char* q) {
    return true;
 }
 
-static bool 
-enter_fchdir(const char*& p, const char* q) {
-   long fd;
-
-   cur_sctype = SC_IMPORTANT;
-   if (!get_long1(fd, p, q))
-      return false;
-
-   if (print_log)
-      prt_fchdir(fd);
-
-   if (*p != '\n')
-      errmsg("Missing newline", p, q);
-   p++; // Skip the trailing newline character at the end of the record
-   return true;
-}
-
-static bool 
-enter_link(const char*& p, const char* q) {
-   char *s1, *s2;
-   long ofd, nfd, flags;
-
-   cur_sctype = SC_IMPORTANT;
-   if (!get_str2_long3(s1, s2, ofd, nfd, flags, p, q))
-      return false;
-
-   if (print_log) 
-      prt_link(ofd, nfd, s1, s2, flags);
-
-   if (*p != '\n')
-      errmsg("Missing newline", p, q);
-   p++; // Skip the trailing newline character at the end of the record
-   return true;
-}
-
-static bool 
-enter_symlink(const char*& p, const char* q) {
-   char *s1, *s2;
-   long fd;
-
-   cur_sctype = SC_IMPORTANT;
-   if (!get_str2_long1(s1, s2, fd, p, q))
-      return false;
-
-   if (print_log) 
-      prt_symlink(fd, s1, s2);
-
-   if (*p != '\n')
-      errmsg("Missing newline", p, q);
-   p++; // Skip the trailing newline character at the end of the record
-   return true;
-}
-
-static bool 
-enter_rename(const char*& p, const char* q) {
-   char *s1, *s2;
-   long ofd, nfd, flags;
-
-   cur_sctype = SC_IMPORTANT;
-   if (!get_str2_long3(s1, s2, ofd, nfd, flags, p, q))
-      return false;
-
-   if (print_log) 
-      prt_rename(ofd, nfd, s1, s2, flags);
-
-   if (*p != '\n')
-      errmsg("Missing newline", p, q);
-   p++; // Skip the trailing newline character at the end of the record
-   return true;
-}
-
-/*******************************************************************************
- * Code added for adding Parser for SPLICE,VMSPICE and TEE syscall*
- * *****************************************************************************/
 static bool
-enter_splice(const char*& p, const char* q) {
+exit_mkdir(const char*& p, const char* q) {
+   char* fn;
+   long fd, id, mode, ret;
+
+   if (!get_str_long3(fn, fd, id, ret, p, q))
+      return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   mode = ret >> 32;
+   ret = (int)ret;
+   if (eConsumer)
+      eConsumer->mkdirat(MKDIR_EX, sn, clk_ts, tid, pid, fd, id, fn, mode, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_mkdir(fd, id, fn, mode, ret, pofp, is_tampered);
+
+   if (*p != '\n')
+      errmsg("Missing newline", p, q);
+   p++; // Skip the trailing newline character at the end of the record
+   return true;
+}
+
+static bool
+exit_mknod(const char*& p, const char* q) {
+   char* fn;
+   long fd, id, mode, dev, ret;
+
+   if (!get_str_long4(fn, fd, dev, ret, id, p, q))
+      return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   mode = ret >> 8;
+   ret = (char)ret;
+
+   if (eConsumer)
+      eConsumer->mknodat(MKNOD_EX, sn, clk_ts, tid, pid, fd, id,fn,mode,dev,ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_mknod(fd, id, fn, mode, dev, ret, pofp, is_tampered);
+
+   if (*p != '\n')
+      errmsg("Missing newline", p, q);
+   p++; // Skip the trailing newline character at the end of the record
+   return true;
+}
+
+static bool
+exit_rmdir(const char*& p, const char* q) {
+   char* fn;
+   long ret;
+   if (!get_str_long1(fn, ret, p, q))
+      return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   if (eConsumer)
+      eConsumer->rmdir(RMDIR_EX, sn, clk_ts, tid, pid, fn, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_rmdir(fn, ret, pofp, is_tampered);
+
+   if (*p != '\n')
+      errmsg("Missing newline", p, q);
+   p++; // Skip the trailing newline character at the end of the record
+   return true;
+}
+
+static bool
+exit_chdir(const char*& p, const char* q) {
+   char* fn;
+   long ret;
+   cur_sctype = SC_IMPORTANT;
+   if (!get_str_long1(fn, ret, p, q))
+      return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_chdir(fn, ret, pofp, is_tampered);
+
+   if (eConsumer)
+      eConsumer->chdir(CHDIR_EX, sn, clk_ts, tid, pid, fn, ret);
+
+   if (*p != '\n')
+      errmsg("Missing newline", p, q);
+   p++; // Skip the trailing newline character at the end of the record
+   return true;
+}
+
+static bool
+exit_fchdir(const char*& p, const char* q) {
+   long fd, id;
+   long ret;
+   cur_sctype = SC_IMPORTANT;
+   if (!get_long3(fd, id, ret, p, q))
+      return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   if (eConsumer)
+      eConsumer->fchdir(FCHDIR_EX, sn, clk_ts, tid, pid, fd, id, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_fchdir(fd, id, ret, pofp, is_tampered);
+
+   if (*p != '\n')
+      errmsg("Missing newline", p, q);
+   p++; // Skip the trailing newline character at the end of the record
+   return true;
+}
+
+static bool
+exit_link(const char*& p, const char* q) {
+   char *s1, *s2;
+   long ofd, nfd, oid, nid, flags, ret;
+
+   cur_sctype = SC_IMPORTANT;
+   if (!get_str2_long5(s1, s2, ofd, nfd, ret, oid, nid, p, q))
+      return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   flags = ret >> 32;
+   ret = (int)ret;
+
+   if (eConsumer)
+      eConsumer->linkat(LINK_EX, sn, clk_ts, tid, pid, ofd, oid, s1, nfd, nid,
+                             s2, flags, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_link(ofd, oid, nfd, nid, s1, s2, flags, ret, pofp, is_tampered);
+
+   if (*p != '\n')
+      errmsg("Missing newline", p, q);
+   p++; // Skip the trailing newline character at the end of the record
+   return true;
+}
+
+static bool exit_chown(const char *&p, const char *q) {
+  char *s1;
+  long user, group, ret, fd, id, flags;
+
+  cur_sctype = SC_IMPORTANT;
+  if (!get_str_long5(s1, fd, user, group, id, ret, p, q))
+    return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+  flags = ret >> 8;
+  ret = (char)ret;
+
+   if (eConsumer)
+      eConsumer->chownat(CHOWN_EX, sn, clk_ts, tid, pid, fd, id, s1, 
+                         user, group, flags, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+  if (prtInParser)
+    prt_chown(s1, user, group, fd, id, flags, ret, pofp, is_tampered);
+  if (*p != '\n')
+    errmsg("Missing newline", p, q);
+  p++; // Skip the trailing newline character at the end of the record
+  return true;
+}
+
+static bool exit_fchown(const char *&p, const char *q) {
+  long fd, id, user, group, ret;
+
+  cur_sctype = SC_IMPORTANT;
+  if (!get_long4(user, group, ret, id, p, q))
+    return false;
+
+  fd = ret >> 8;
+  ret = (char)ret;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   if (eConsumer)
+      eConsumer->fchown(FCHOWN_EX, sn, clk_ts, tid, pid, fd, id, user, group, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+  if (prtInParser)
+      prt_fchown(fd, id, user, group, ret, pofp, is_tampered);
+
+  if (*p != '\n')
+    errmsg("Missing newline", p, q);
+  p++; // Skip the trailing newline character at the end of the record
+  return true;
+}
+
+static bool exit_mount(const char *&p, const char *q) {
+  char *src, *dst, *fstp;
+  long flags, ret;
+
+  cur_sctype = SC_IMPORTANT;
+  if (!get_str3_long2(src, dst, fstp, flags, ret, p, q))
+    return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   if (eConsumer)
+     eConsumer->mount(MOUNT_EX, sn, clk_ts, tid, pid, src, dst, fstp, flags, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+  if (prtInParser)
+      prt_mount(src, dst, fstp, flags, ret, pofp, is_tampered);
+
+  if (*p != '\n')
+    errmsg("Missing newline", p, q);
+  p++; // Skip the trailing newline character at the end of the record
+  return true;
+}
+
+static bool exit_umount(const char *&p, const char *q) {
+  char *s1;
+  long flags, ret;
+
+  cur_sctype = SC_IMPORTANT;
+  if (!get_str_long2(s1, flags, ret, p, q)) {
+      return false;
+  }
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   if (eConsumer)
+     eConsumer->umount(UMOUNT_EX, sn, clk_ts, tid, pid, s1, flags,
+         ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+  if (prtInParser)
+      prt_umount(s1, flags, ret, pofp, is_tampered);
+
+
+  if (*p != '\n')
+    errmsg("Missing newline", p, q);
+  p++; // Skip the trailing newline character at the end of the record
+  return true;
+}
+
+static bool
+exit_symlink(const char*& p, const char* q) {
+   char *s1, *s2;
+   long fd, id, ret;
+
+   cur_sctype = SC_IMPORTANT;
+   if (!get_str2_long3(s1, s2, fd, id, ret, p, q))
+      return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   if (eConsumer)
+      eConsumer->symlinkat(SYMLINK_EX, sn, clk_ts, tid, pid, s1,
+         fd, id, s2, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_symlink(fd, id, s1, s2, ret, pofp, is_tampered);
+
+   if (*p != '\n')
+      errmsg("Missing newline", p, q);
+   p++; // Skip the trailing newline character at the end of the record
+   return true;
+}
+
+static bool
+exit_rename(const char*& p, const char* q) {
+   char *s1, *s2;
+   long ofd, nfd, oid, nid, flags;
+   long ret;
+   cur_sctype = SC_IMPORTANT;
+   if (!get_str2_long5(s1, s2, ofd, nfd, ret, oid, nid, 
+          p, q))
+      return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   flags = ret >> 32;
+   ret = (int)ret;
    
-   long fd_in, fd_out, len;
-   int flags;
+   if (eConsumer)
+      eConsumer->renameat(RENAME_EX, sn, clk_ts, tid, pid, ofd, oid, s1,
+                              nfd, nid, s2, flags, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
 
-   cur_sctype = SC_IMPORTANT;
-   if (!get_long3int( len, fd_in, fd_out, flags, p, q))
-      return false;
-
-   if (print_log)
-      prt_splice(0, 0, len, fd_in, fd_out, flags);
+   if (prtInParser)
+      prt_rename(ofd, oid, nfd, nid, s1, s2, flags, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // Skip the trailing newline character at the end of the record
    return true;
-
 }
 
 static bool
-enter_vmsplice(const char*& p, const char* q) {
-   long fd, flags ;
+exit_vmsplice(const char*& p, const char* q) {
+   long fd, id, ret;
 
    cur_sctype = SC_IMPORTANT;
-   if (!get_long2(fd, flags, p, q))
+   if (!get_long3(fd, id, ret, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_vmsplice(fd, flags);
+   if (eConsumer)
+      eConsumer->vmsplice(VMSPLICE_EX, sn, clk_ts, tid, pid, (int)fd,
+                            id, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_vmsplice(fd, id, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // Skip the trailing newline character at the end of the record
    return true;
-
 }
 
-static bool
-enter_tee(const char*& p, const char* q) {
-   long fdin, fdout, len;
-   int flags;
-
-   cur_sctype = SC_IMPORTANT;
-   if (!get_long3int(fdin, fdout, len, flags, p, q))
-      return false;
-
-   if (print_log)
-      prt_tee(fdin, fdout, len, flags);
-
-   if (*p != '\n')
-      errmsg("Missing newline", p, q);
-   p++; // Skip the trailing newline character at the end of the record
-   return true;
-
-}
-
+/*
 static bool
 enter_socket(const char*& p, const char* q) {
-   long family, type, protocol;
+   long fmly, type, proto, ret=0;
 
    cur_sctype = SC_IMPORTANT;
-   if (!get_long3(family, type, protocol, p, q))
+   exit_op = false;
+   if (!get_long3(fmly, type, proto, p, q))
       return false;
+   if (eConsumer)
+      eConsumer->socket(SOCKET_EX, sn, clk_ts, tid, pid, fmly,
+         type, proto, ret);
 
-   if (print_log)
-      prt_socket(family, type, protocol);
+   if (prtInParser)
+      prt_socket(fmly, type, proto, pofp);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // Skip the trailing newline character at the end of the record
    return true;
-
 }
-static bool 
+*/
+
+static bool
 enter_kill(const char*& p, const char* q) {
    long pid_tgid, sig;
 
    cur_sctype = SC_CRITICAL;
+   exit_op = false;
    if (!get_long2(pid_tgid, sig, p, q))
       return false;
-   int pid1 = pid_tgid >> 32;
-   int tid1 = pid_tgid & ((1ul << 32)-1);
+   int pid1 = pid_tgid & ((1ul << 32)-1);
+   int tid1 = pid_tgid >> 32;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log) 
-      prt_kill(pid1, tid1, (int)sig);
+   if (eConsumer)
+      eConsumer->ent_kill(KILL_EX, sn, clk_ts, tid, pid, pid1, tid1, sig);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_kill_no_ret(pid1, tid1, (int)sig, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1685,16 +1640,25 @@ enter_kill(const char*& p, const char* q) {
    return true;
 }
 
-static bool 
+static bool
 enter_ptrace(const char*& p, const char* q) {
-   long pid1, req;
+   long target_tid, req;
 
    cur_sctype = SC_CRITICAL;
-   if (!get_long2(req, pid1, p, q))
+   exit_op = false;
+   if (!get_long2(req, target_tid, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_ptrace((int)pid1, req);
+   if (eConsumer)
+      eConsumer->ent_ptrace(PTRACE_EX, sn, clk_ts, tid, pid,
+         req, (int)target_tid);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_ptrace((int)target_tid, req, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1702,17 +1666,25 @@ enter_ptrace(const char*& p, const char* q) {
    return true;
 }
 
-static bool 
-enter_chmod(const char*& p, const char* q) {
+static bool
+exit_chmod(const char*& p, const char* q) {
    char* fn;
-   long fd, mode;
+   long fd, id, mode, ret;
 
    cur_sctype = SC_IMPORTANT;
-   if (!get_str_long2(fn, mode, fd, p, q))
+   if (!get_str_long4(fn, fd, mode, ret, id, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log) 
-      prt_chmod(fd, fn, mode);
+   if (eConsumer)
+      eConsumer->chmodat(CHMOD_EX, sn, clk_ts, tid, pid, fd, id,
+         fn, mode, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_chmod(fd, id, fn, mode, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1720,16 +1692,26 @@ enter_chmod(const char*& p, const char* q) {
    return true;
 }
 
-static bool 
-enter_fchmod(const char*& p, const char* q) {
-   long fd, mode;
+static bool
+exit_fchmod(const char*& p, const char* q) {
+   long fd, id, mode, ret;
 
    cur_sctype = SC_IMPORTANT;
-   if (!get_long2(fd, mode, p, q))
+   if (!get_long3(mode, id, ret, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_fchmod(fd, mode);
+   fd = ret >> 8;
+   ret = (char)ret;
+
+   if (eConsumer)
+      eConsumer->fchmod(FCHMOD_EX, sn, clk_ts, tid, pid, fd, id, mode, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_fchmod(fd, id, mode, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1737,16 +1719,24 @@ enter_fchmod(const char*& p, const char* q) {
    return true;
 }
 
-static bool 
-enter_setuid(const char*& p, const char* q) {
-   long ruid, euid, suid;
+static bool
+exit_setuid(const char*& p, const char* q) {
+   long ruid, euid, suid, ret;
 
    cur_sctype = SC_CRITICAL;
-   if (!get_long3(ruid, euid, suid, p, q))
+   if (!get_long4(ruid, euid, suid, ret, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log) 
-      prt_setuid((int)euid, (int)ruid, (int)suid);
+   if (eConsumer)
+      eConsumer->setuid(SETUID_EX, sn, clk_ts, tid, pid,(int)ruid,
+                            (int)euid,(int)suid, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_setuid((int)euid, (int)ruid, (int)suid, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1754,16 +1744,25 @@ enter_setuid(const char*& p, const char* q) {
    return true;
 }
 
-static bool 
-enter_setgid(const char*& p, const char* q) {
-   long rgid, egid, sgid;
+static bool
+exit_setgid(const char*& p, const char* q) {
+   long rgid, egid, sgid, ret;
 
    cur_sctype = SC_IMPORTANT;
-   if (!get_long3(rgid, egid, sgid, p, q))
+   if (!get_long4(rgid, egid, sgid, ret, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_setgid((int)egid, (int)rgid, (int)sgid);
+   if (eConsumer)
+      eConsumer->setgid(SETGID_EX, sn, clk_ts, tid, pid,
+                            (int)rgid, (int)egid,
+                              (int)sgid, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_setgid((int)egid, (int)rgid, (int)sgid, ret, pofp, is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1774,10 +1773,19 @@ enter_setgid(const char*& p, const char* q) {
 static bool
 enter_fork(const char*& p, const char* q) {
    cur_sctype = SC_IMPORTANT;
+   exit_op = false;
    if (!get_ts_and_widths(p, q)) return false;
-   if (print_log)
-      prt_fork();
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
 
+   if (prtInParser)
+      prt_fork(pofp, is_tampered);
+
+   if (eConsumer)
+      eConsumer->ent_clone(FORK_EX, sn, clk_ts, tid, pid, 0);
+   
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // Skip the trailing newline character at the end of the record
@@ -1789,31 +1797,58 @@ exitt_ids(uint8_t sc, const char*& p, const char* q) {
    long ret;
    long uid_gid, cgroup;
 
-   exit_op = true; no_ts = false;
+   no_entry = false;
    if (!get_long3(uid_gid, cgroup, ret, p, q))
       return false;
-   if (is_err(ret)) exit_errs++;
+   int parent_tid = (ret >> 32) & 0xffffffffl;
+   int rv = ret & 0xffffffffl;
+
+   if (is_err(rv)) exit_errs++;
    int uid = uid_gid & ((1ul<<32)-1);
    int gid = uid_gid >> 32;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_exitids(sc, ret, uid, gid, cgroup);
+   if (eConsumer) {
+      if (sc == EXECVE_EX)
+         eConsumer->exec_exit(sc, sn, clk_ts, tid, pid,
+                             parent_tid, rv, uid, gid, cgroup);
+      else eConsumer->clone_exit(sc, sn, clk_ts, tid, pid,
+                             parent_tid, rv, uid, gid, cgroup);
+   }
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_exitids(scname[sc], parent_tid, rv, uid, gid,
+                     cgroup, pid, tid, last_pid, last_tid, force_ts, pofp, 
+                     is_tampered);
+   
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // We include a newline at the end of records, skip it
    return true;
 }
 
-static bool 
+static bool
 enter_clone(const char*& p, const char* q) {
    long flags;
 
+   exit_op = false;
    cur_sctype = SC_IMPORTANT;
    if (!get_long1(flags, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_clone(flags);
+   if (eConsumer)
+      eConsumer->ent_clone(CLONE_EX, sn, clk_ts, tid, pid, flags);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+   prt_clone(flags, pofp, is_tampered);
+
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // Skip the trailing newline character at the end of the record
@@ -1823,46 +1858,52 @@ enter_clone(const char*& p, const char* q) {
 static bool
 enter_execve(const char*& p, const char* q, bool env_incl) {
    char* fn;
-   long flags, fd;
-   int argc, envc=0;
-   char *argv[32], *envp[32];
+   long flags, fd, id;
+   int argc = 0, envc = 0;
+   char *argv[MAX_ARG], *envp[MAX_ARG];
 
+   exit_op = false;
    cur_sctype = SC_CRITICAL;
-   if (!get_str_long2(fn, flags, fd, p, q)) return false;
+   if (!get_str_long3(fn, flags, fd, id, p, q)) return false;
 
-   argc = *p++;
-   if (argc >= 32) return false;
-   
+   int argv_lb = (*p++ & 0xff);
+   int argv_hb = (*p++ << 8);
+   argc = (argv_hb | argv_lb);
+
+   if (argc > MAX_ARG) return false;
+
    for (int i=0; i < argc; i++)
-      if (!get_string(argv[i], p, q, print_log? ',' : 1))
+      if (!get_string(argv[i], p, q/*, prtInParser? ',' : '\0'*/))
          return false;
 
-   char *args;
-   if (argc > 0) {
-      args = argv[0];
+   if (argc > 0)
       repl_last_char_strbuf('\0');
-   }
-   else args = copy2strbuf(p, 0, '\0');
    argv[argc] = nullptr;
 
    if (env_incl) {
-      envc = *p++;
-      if (envc >= 32) return false;
+      int envc_lb = (*p++ & 0xff);
+      int envc_hb = (*p++ << 8);
+      envc = (envc_hb | envc_lb);
+      if (envc > MAX_ARG) return false;
       for (int i=0; i < envc; i++)
-         if (!get_string(envp[i], p, q, print_log? '\n' : 1)) 
+         if (!get_string(envp[i], p, q/*, prtInParser? '\n' : '\0'*/))
             return false;
    }
 
-   const char *envs;
-   if (envc > 0) {
-      envs = envp[0];
+   if (envc > 0)
       repl_last_char_strbuf('\0');
-   }
-   else envs =  copy2strbuf(p, 0, '\0');
    envp[envc] = nullptr;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log) 
-      prt_execve(fd, flags, fn, args, envs);
+   if (eConsumer)
+      eConsumer->ent_execveat(EXECVE_EX, sn, clk_ts, tid, pid, fd, id, flags,
+                              fn, argv, envp);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+   if (prtInParser)
+      prt_execve(fd, id, flags, fn, argv, envp, /*args, envs,*/ pofp, 
+                  is_tampered);
 
    if (*p != '\n')
       errmsg("Missing newline", p, q);
@@ -1874,12 +1915,21 @@ static bool
 enter_exit(const char*& p, const char* q) {
    long flags;
 
+   exit_op = false;
    cur_sctype = SC_IMPORTANT;
    if (!get_long1(flags, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_exit(flags);
+   if (eConsumer)
+      eConsumer->ent_exit(EXIT_EN, sn, clk_ts, tid, pid, flags);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_exit(flags, pofp, is_tampered);
+
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // Skip the trailing newline character at the end of the record
@@ -1890,58 +1940,78 @@ static bool
 enter_exitgrp(const char*& p, const char* q) {
    long flags;
 
+   exit_op = false;
    cur_sctype = SC_IMPORTANT;
    if (!get_long1(flags, p, q))
       return false;
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
 
-   if (print_log)
-      prt_exitgrp(flags);
+   if (eConsumer)
+      eConsumer->ent_exit(EXITGRP_EN, sn, clk_ts, tid, pid, flags);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_exitgrp(flags, pofp, is_tampered);
+
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // Skip the trailing newline character at the end of the record
    return true;
 }
-/*******************************************************************************
- * Code added for adding Parser for finit_module syscall*
- * *****************************************************************************/
+
 static bool
-enter_finit_module(const char*& p, const char* q){
-   long fd,flags;
-   char * usr_args;
+exit_finit_module(const char*& p, const char* q) {
+   long fd, id, flags, ret;
+   char *params;
    cur_sctype = SC_CRITICAL;
-   if (!get_str_long2(usr_args, fd, flags, p, q))
+   if (!get_str_long4(params, fd, flags, ret, id, p, q))
       return false;
-   if (print_log)
-      prt_finit_module(usr_args, fd, flags);
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+    if (eConsumer)
+      eConsumer->finit_module(FINITMOD_EX, sn, clk_ts, tid, pid, (int)fd, id,
+                            params, (int)flags, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if (prtInParser)
+      prt_finit_module(params, fd, id, flags, ret, pofp, is_tampered);
+
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // Skip the trailing newline character at the end of the record
    return true;
 }
 
-/*******************************************************************************
- * Code added for adding Parser for init_module syscall*
- * *****************************************************************************/
-
 static bool
-enter_init_module(const char*& p, const char * q){
-   char * usr_args;
-   char * data;
-   long slen=0;
-   // if (!get_str_data_long0(usr_args, data, slen, p , q))
-   //    return false;
-   if (!get_str2_long1(usr_args, data, slen, p , q))
+exit_init_module(const char*& p, const char * q) {
+   char * params;
+   long ret;
+
+   if (!get_str_long1(params, ret, p , q))
       return false;
-   if(print_log)
-      prt_init_module(usr_args, data, slen);
+   RecordCryptoFields crypto;
+   bool is_tampered = false;
+   if (!read_record_crypto_fields(p, q, crypto)) return false;
+
+   if (eConsumer)
+      eConsumer->init_module(INITMOD_EX, sn, clk_ts, tid, pid, params, ret);
+   verify_record_crypto_fields(p, q, crypto, is_tampered);
+
+   if(prtInParser)
+      prt_init_module(params, ret, pofp, is_tampered);
+
    if (*p != '\n')
       errmsg("Missing newline", p, q);
    p++; // Skip the trailing newline character at the end of the record
    return true;
-
 }
 
 static bool out_of_sync;
+extern bool long_seqnum;
 
 static void
 parse_buffer(const char *& p, const char* q, bool ended=false) {
@@ -1969,64 +2039,77 @@ parse_buffer(const char *& p, const char* q, bool ended=false) {
       while (!out_of_sync && (p < q)) {
          // We don't want to start parsing a record and then realize that we don't
          // have a complet record. So, we check for the maximum possible record
-         // size, and if we don't have that many bytes left, then we return. 
+         // size, and if we don't have that many bytes left, then we return.
          // But if the input file has already ended, then we continue till the end.
 
-         int max_rec_len = (*p == EXECVE_EN || *p == EXECVEE_EN)? 8250 : 512;
+         int max_rec_len = (*p == EXECVE_EN || *p == EXECVEE_EN)? BUFSIZE : 512;
          if (!ended && (p + max_rec_len >= q)) // If the file ended, then we will
-            return;                            // continue to parse till the end.
-                                               // If not, read the whole msg.
+            return; // continue to parse till the end, else wait for more content
+
          bool env_incl = false;
-         bool succ = false; 
-         exit_op = false; no_ts = true; no_entry = false;
+         bool succ = false;
+         exit_op = true;  no_entry = true;
          current_rec = p;
          reset_strbuf();
 
          char sc = *p++;
          if (sc != TS_DIFF && sc != TS_KERN && sc != TSMS_EN) {
-            if (useseqnum) {
-               sn = *(const uint16_t*)p; p += 2;
+            if (use_seqnum) {
+               if (long_seqnum) {
+                  sn = *(const uint32_t*)p; p += 4;
+                  // printf("seq=%u\n", sn);
+               }
+               else {
+                  sn = *(const uint16_t*)p; p += 2;
+               }
             }
-            if (useprocid) {
+            if (use_procid) {
                procid = *p; p += 1;
             }
          }
          cur_sctype = SC_DEFAULT;
          switch (sc) {
-         case TS_DIFF: 
+         case TS_DIFF: {
             tsdiff_rec++;
-            clk_kernel_diff = *(uint64_t*)p;
-            p += 8; succ = true; break;
+            uint64_t realtime_ts = *(uint64_t*)p; p += 8;
+            uint64_t monotonic_ts = *(uint64_t*)p; p += 8;
+            clk_kernel_diff = realtime_ts - monotonic_ts;
+            if (eConsumer)
+               eConsumer->cur_time(realtime_ts);
+            succ = true; exit_op = false; break;
+         }
 
-         case TS_KERN: 
+         case TS_KERN: {
             tsdiff_rec++;
-            clk_kernel = *(uint64_t*)p;
+            uint64_t prev_tamperwin_start = tamperwin_start;
+            tamperwin_start = *(uint64_t*)p;
+            if (prev_tamperwin_start > 0)
+               tamper_period.addPoint((tamperwin_start 
+                                       - prev_tamperwin_start)/1000);
             tamper_windows++;
             tamper_totclag += tamper_thisclag;
-            tamperclag.addPoint(tamper_thisclag/1e3);
+            tamperclag.addPoint(tamper_thisclag/1000);
             tamper_thisclag = 0;
             tamper_totilag += tamper_thisilag;
-            tamperilag.addPoint(tamper_thisilag/1e3);
+            tamperilag.addPoint(tamper_thisilag/1000);
             tamper_thisilag = 0;
             tamper_totlag += tamper_thislag;
-            tamperlag.addPoint(tamper_thislag/1e3);
+            tamperlag.addPoint(tamper_thislag/1000);
             tamper_thislag = 0;
-            p += 8; succ = true; break;
+            p += 8; succ = true; exit_op = false; break;
+         }
 
          case TSMS_EN:
             p--;
             if (!CHK_TSREC(p)) {
-               out_of_sync = true; 
+               errmsg("Error while parsing a TSMS_EN record", p, q);
+               out_of_sync = true;
                goto outer_loop;
             }
             tsms_rec++;
             kernel_ts_msb = GET_TSREC(p);
-            p += 8; succ=true;
+            p += 8; succ=true; exit_op = false;
             break;
-
-         case BIND_EN:     succ = enter_bind(p, q); break;
-         case CHDIR_EN:    succ = enter_chdir(p, q); break;
-         case CHMOD_EN:    succ = enter_chmod(p, q); break;
          case CLONE_EN:    succ = enter_clone(p, q); break;
          case CLOSE_EN:    succ = enter_close(p, q); break;
          case EXIT_EN:     succ = enter_exit(p, q); break;
@@ -2035,86 +2118,69 @@ parse_buffer(const char *& p, const char* q, bool ended=false) {
          case EXECVE_EN:   // Fall through intentional
                            succ = enter_execve(p, q, env_incl);
                            break;
-         case FCHDIR_EN:   succ = enter_fchdir(p, q); break;
-         case FCHMOD_EN:   succ = enter_fchmod(p, q); break;
-         case FORK_EN:     succ = enter_fork(p, q); break;
-         case FTRUNC_EN:   succ = enter_ftruncate(p, q); break;
          case KILL_EN:     succ = enter_kill(p, q); break;
-         case LINK_EN:     succ = enter_link(p, q); break;
-         case MKDIR_EN:    succ = enter_mkdir(p, q); break;
-         case MMAP_EN:     succ = enter_mmap(p, q); break;
+         case FORK_EN:     succ = enter_fork(p, q); break;
          case PTRACE_EN:   succ = enter_ptrace(p, q); break;
-         case RENAME_EN:   succ = enter_rename(p, q); break;
-         case RMDIR_EN:    succ = enter_rmdir(p, q); break;
-         case SETGID_EN:   succ = enter_setgid(p, q); break;
-         case SETUID_EN:   succ = enter_setuid(p, q); break;
-         case SYMLINK_EN:  succ = enter_symlink(p, q); break;
-         case TRUNC_EN:    succ = enter_truncate(p, q); break;
-         case UNLINK_EN:   succ = enter_unlink(p, q); break;
-         case MKNOD_EN:    succ = enter_mknod(p,q); break;
-         case FI_MODULE_EN:succ = enter_finit_module(p,q); break;
-         case I_MODULE_EN: succ = enter_init_module(p,q); break;
-         case SPLICE_EN:   succ = enter_splice(p,q); break;
-         case VMSPLICE_EN: succ = enter_vmsplice(p,q); break;
-         case TEE_EN:      succ = enter_tee(p,q); break;
-         case SOCKET_EN:   succ = enter_socket(p,q); break;
          case ACCEPT_EX:   succ = exitt_saddr(ACCEPT_EX, p, q); break;
-         case BIND_EX:     succ = exit_sc(BIND_EX, p, q); break;
-         case CHDIR_EX:    succ = exitt_sc(CHDIR_EX, p, q); break;
-         case CHMOD_EX:    succ = exit_sc(CHMOD_EX, p, q); break;
+         case BIND_EX:     succ = exit_bind(p, q); break;
+         case CHDIR_EX:    succ = exit_chdir(p, q); break;
+         case CHMOD_EX:    succ = exit_chmod(p, q); break;
+         case FCHOWN_EX:   succ = exit_fchown(p, q); break;
+         case LCHOWN_EX:   succ = exit_chown(p, q); break;
+         case MOUNT_EX:    succ = exit_mount(p, q); break;
+         case UMOUNT_EX:   succ = exit_umount(p, q); break;
+         case CHOWN_EX:    succ = exit_chown(p, q); break;
          case CLONE_EX:    succ = exitt_ids(CLONE_EX, p, q); break;
-         case CLOSE_EX:    succ = exit_sc(CLOSE_EX, p, q); break;
          case CONNECT_EX:  succ = exit_connect(p, q); break;
          case DUP_EX:      succ = exit_dup(DUP_EX, p, q); break;
          case DUP2_EX:     succ = exit_dup(DUP2_EX, p, q); break;
          case EXECVE_EX:   succ = exitt_ids(EXECVE_EX, p, q); break;
-         case FCHDIR_EX:   succ = exitt_sc(FCHDIR_EX, p, q); break;
-         case FCHMOD_EX:   succ = exit_sc(FCHMOD_EX, p, q); break;
+         case FCHDIR_EX:   succ = exit_fchdir(p, q); break;
+         case FCHMOD_EX:   succ = exit_fchmod(p, q); break;
          case FORK_EX:     succ = exitt_ids(FORK_EX, p, q); break;
-         case FTRUNC_EX:   succ = exit_sc(FTRUNC_EX, p, q); break;
+         case FTRUNC_EX:   succ = exit_ftruncate(p, q); break;
          case GETPEER_EX:  succ = exitt_saddr(GETPEER_EX, p, q); break;
          case KILL_EX:     succ = exit_sc(KILL_EX, p, q); break;
-         case LINK_EX:     succ = exit_sc(LINK_EX, p, q); break;
-         case MKDIR_EX:    succ = exit_sc(MKDIR_EX, p, q); break;
+         case LINK_EX:     succ = exit_link(p, q); break;
+         case MKDIR_EX:    succ = exit_mkdir(p, q); break;
          case MMAP_EX:     succ = exit_mmap(p, q); break;
+         case ERR_REP:     succ = error_entry(p, q); break;
          case MPROTECT_EX: succ = exit_mprotect(p, q); break;
          case OPEN_EX:     succ = exit_open(p, q); break;
          case PIPE_EX:     succ = exit_pipe(PIPE_EX, p, q); break;
          case PTRACE_EX:   succ = exit_sc(PTRACE_EX, p, q); break;
          case READ_EX:     succ = exit_read(p, q); break;
          case RECVFROM_EX: succ = exitt_saddr(RECVFROM_EX, p, q); break;
-         case RENAME_EX:   succ = exit_sc(RENAME_EX, p, q); break;
-         case RMDIR_EX:    succ = exit_sc(RMDIR_EX, p, q); break;
+         case RENAME_EX:   succ = exit_rename(p, q); break;
+         case RMDIR_EX:    succ = exit_rmdir(p, q); break;
          case SENDTO_EX:   succ = exit_sendto(p, q); break;
-         case SETGID_EX:   succ = exit_sc(SETGID_EX, p, q); break;
-         case SETUID_EX:   succ = exit_sc(SETUID_EX, p, q); break;
+         case SETGID_EX:   succ = exit_setgid(p, q); break;
+         case SETUID_EX:   succ = exit_setuid(p, q); break;
          case SOCKPAIR_EX: succ = exit_pipe(SOCKPAIR_EX, p, q); break;
-         case SYMLINK_EX:  succ = exit_sc(SYMLINK_EX, p, q); break;
-         case TRUNC_EX:    succ = exit_sc(TRUNC_EX, p, q); break;
-         case UNLINK_EX:   succ = exit_sc(UNLINK_EX, p, q); break;
+         case SYMLINK_EX:  succ = exit_symlink(p, q); break;
+         case TRUNC_EX:    succ = exit_truncate(p, q); break;
+         case UNLINK_EX:   succ = exit_unlink(p, q); break;
          case WRITE_EX:    succ = exit_write(p, q); break;
-         case I_MODULE_EX: succ = exit_sc(I_MODULE_EX, p, q); break;
-         case FI_MODULE_EX:succ = exit_sc(FI_MODULE_EX, p, q); break;
-         case MKNOD_EX:    succ = exit_sc(MKNOD_EX, p, q); break;
-         case SPLICE_EX:   succ = exit_sc(SPLICE_EX,p,q); break;
-         case VMSPLICE_EX: succ = exit_sc(VMSPLICE_EX,p,q); break;
-         case TEE_EX:      succ = exit_sc(TEE_EX,p,q); break;
-         case SOCKET_EX:   succ = exit_sc(SOCKET_EX,p,q); break;
-         default: 
+         case INITMOD_EX: succ = exit_init_module(p, q); break;
+         case FINITMOD_EX:succ = exit_finit_module(p, q); break;
+         case MKNOD_EX:    succ = exit_mknod(p, q); break;
+         case VMSPLICE_EX: succ = exit_vmsplice(p,q); break;
+         default:
             succ = false;
             break;
          }
 
-         if (succ) 
+         if (succ) {
             if (exit_op) {
                exit_rec++;
                scexit_count[(uint8_t)sc]++;
             }
             else {
-               entry_rec++; 
+               entry_rec++;
                if (sc != TS_DIFF && sc != TS_KERN && sc != TSMS_EN)
                   sc_count[(uint8_t)sc]++;
             }
+         }
          else {
             err_rec++;
             errmsg("Error while parsing a record", p, q);
@@ -2126,7 +2192,7 @@ parse_buffer(const char *& p, const char* q, bool ended=false) {
 }
 
 void parse_rec(const char *p, size_t len) {
-   buf = (char*)p;
+   rbuf = p;
    parse_buffer(p, &p[len], true);
 }
 
@@ -2139,17 +2205,14 @@ parse_stream() {
    ssize_t nb=-1000000;
    nr=0;
 
-   // The possible largest record size is about 8K for execve. Use a buffer that
-   // is 8 times larger, so data copies (from buffer end to beginning) will be
-   // no more than 1/7th of the data that was gainfully processed.
    while (true) {
       // Invariant: unconsumed input starts at p=buf, ends just before q
       long remSpc = PBUFSIZE - (q - buf);
       while (remSpc > min(8192, PBUFSIZE/5)) { // while buffer isn't close to full
          // Invariant on p, q continues to hold, except p is no longer same as buf.
-
          if ((nb = read(infd, q, remSpc)) <= 0)
             goto done;
+
          nr += nb;
          q += nb; // Above invariant on p, q still hold; plus, q > p since nb > 0.
          remSpc -= nb;
@@ -2178,162 +2241,45 @@ done:
    delete [] buf;
 }
 
-void prtUsage(int argc, char* argv[]) {
-  cerr << "Usage: " << argv[0] << " [-s] [-#] [-c] {-i myIPaddress}+ [-l logLevel]"
-   " {-n networkAddr/netMask}+ [-o] [-pf] [-ps] [-r] [-w width]"
-   " [-I <auditFile>] [-P [<printFile>]] [-R <recordFile>]\n"
-   "    -c: sort counts by frequency\n"
-   "    -l logLevel: specify logging level, defaults to "<< ERRLEVEL << endl <<
-   "    -o: record opens in the record file\n"
-   "    -pf: print the list of files accessed\n"
-   "    -ps: print the list of sockets accessed\n"
-   "    -r: record reads and writes in the record file\n"
-   "    -s: indicates that sequence numbers are NOT included in capture file\n"
-   "    -#: indicates that processor core #s are included in capture file\n"
-   "    -w width: format output for display with width columns\n"
-   "eAudit records are read from stdin or <auditFile>.\n"
-   "They are printed to <printFile> (default: stdout) if -P flag is specified.\n"
-   "Information recorded in <recordFile> if -R option is specified.\n"
-   "Record file will use gzip compression if <recordFile> ends with .gz.\n";
-   exit(1);
-}
-
-int width=80;
-int logLevel=ERRLEVEL; // WARNLEVEL, ERRLEVEL, etc. Zero means don't complain
-
-static void
-parseCmdline(int argc, char* argv[], const char*& infn,
-             bool& do_print, const char*& prtfn, const char*& recfn, 
-             bool& use_seqnum, bool& use_procid, bool& auditRdWr, bool& logOpen,
-             bool& summarizeFiles, bool& summarizeEP, bool& sortByFreq,
-             vector<unsigned>*& ipaddrs, vector<unsigned>*& netmasks, 
-             vector<unsigned>*& netaddrs) {
-
-   infn=nullptr;
-   do_print=false;
-   prtfn=nullptr;
-   recfn=nullptr;
-   use_seqnum = true;
-   use_procid = false;
-   auditRdWr=true;
-   logOpen=false;
-   summarizeFiles=false;
-   summarizeEP=false;
-   sortByFreq=true;
-   ipaddrs=nullptr;
-   netmasks=nullptr;
-   netaddrs=nullptr;
-
-   for (int i=1; i < argc; i++) {
-      if (argv[i][0] == '-') {
-         switch (argv[i][1]) {
-         case 'c': sortByFreq=true; break;
-
-         case 'i': {
-            unsigned r1, r2, r3, r4;
-            if (++i >= argc ||
-                 (sscanf(argv[i], "%d.%d.%d.%d", &r1, &r2, &r3, &r4) < 4))
-                prtUsage(argc, argv);
-            ipaddrs = new vector<unsigned>;
-            ipaddrs->push_back((r1<<24)+(r2<<16)+(r3<<8)+r4);
-            break;
-         }
-
-         case 'l':
-            if (++i >= argc ||
-                (sscanf(argv[i], "%d", &logLevel) < 1))
-               prtUsage(argc, argv);
-            break;
-
-         case 'n': {
-            unsigned r1, r2, r3, r4, r5, r6, r7, r8;
-            if (++i >= argc ||
-                (sscanf(argv[i], "%d.%d.%d.%d/%d.%d.%d.%d", &r1, &r2, &r3, &r4,
-                   &r5, &r6, &r7, &r8) < 8))
-               prtUsage(argc, argv);
-            netaddrs = new vector<unsigned>;
-            netmasks = new vector<unsigned>;
-            netaddrs->push_back((r1<<24)+(r2<<16)+(r3<<8)+r4);
-            netmasks->push_back((r5<<24)+(r6<<16)+(r7<<8)+r8);
-            break;
-         }
-
-         case 'o': logOpen = true; break;
-
-         case 'p': 
-            if (argv[i][2] == 'f') 
-               summarizeFiles = true;
-            else if (argv[i][2] == 's')
-               summarizeEP = true;
-            else prtUsage(argc, argv);
-            break;
-
-         case 'r': auditRdWr = true; break;
-
-         case 'w':
-            if (++i >= argc ||
-                (sscanf(argv[i], "%d", &width) < 1))
-               prtUsage(argc, argv);
-            break;
-
-         case 'I':
-            if (++i >= argc)
-               prtUsage(argc, argv);
-            infn = argv[i];
-            break;
-
-         case 'P':
-            do_print = true;
-            if (++i >= argc)
-               prtUsage(argc, argv);
-            prtfn = argv[i];
-            break;            
-
-         case 'R':
-            if (++i >= argc)
-               prtUsage(argc, argv);
-            recfn = argv[i];
-            break;
-
-         case '#':
-            use_procid = !use_procid;
-            break;
-
-         case 's':
-            use_seqnum = !use_seqnum;
-            break;
-
-         default: prtUsage(argc, argv); break;
-         }
-      }
-   }
-}
+#include "cmdln.C"
 
 void
-parser_init(const char* infn, const char* prtfn, const char* recfn, 
-            bool use_seqnum, bool use_procid, bool auditRdWr, bool logOpen, 
-            bool summarizeFiles, 
-            bool summarizeEP, bool sortByFreq, const vector<unsigned>* ipaddrs, 
-            const vector<unsigned>* netmasks, const vector<unsigned>* netaddrs) {
-
+parser_init() {
    init_scname();
-
-   if (infn) {
-      if ((infd = open(infn, O_RDONLY)) < 0)
-         errexit("Unable to open input file");
-   }
-   else infd = 0; // By default, input read from stdin
-
-   if (prtfn && *prtfn) {
-      print_log = true;
-      if (*prtfn != '-') {
-         ofp = fopen(prtfn, "w");
-         if (!ofp)
-            errexit("Unable to open output file");
+   if (verifyLog) {
+      if (!allocate_verifier_signing_keys()) {
+         clear_and_free_verifier_signing_keys(verifier_signing_keys_lo);
+         clear_and_free_verifier_signing_keys(verifier_signing_keys_hi);
+         errexit("Memory allocation failed for key ring");
       }
-      else ofp = stdout; // By default, formatted records are printed to stdout
    }
-   else ofp = nullptr;
+   if (!online_mode) {
+      if (capturefn) {
+         if ((infd = open(capturefn, O_RDONLY)) < 0)
+            errexit("Unable to open input file");
+      }
+      else infd = 0; // By default, input read from stdin
+   }
+
+   if (prtpfn && *prtpfn) {
+      if (*prtpfn != '-') {
+         pofp = fopen(prtpfn, "w");
+         if (!pofp)
+            errexit((string("Unable to open output file ") + prtpfn).data());
+      }
+      else pofp = stdout;
+   }
+   else pofp = nullptr;
+
+   if (prtcfn && *prtcfn) {
+      if (*prtcfn != '-') {
+         cofp = fopen(prtcfn, "w");
+         if (!cofp)
+            errexit((string("Unable to open output file ") + prtcfn).data());
+      }
+      else cofp = stdout;
+   }
+   else cofp = nullptr;
 
    /* Ignore SIG_INT if not reading from TTY. Also ignore SIGPIPE. It is better
       to wait for the input stream to be closed or a read to return error. */
@@ -2341,77 +2287,105 @@ parser_init(const char* infn, const char* prtfn, const char* recfn,
       signal(SIGINT, SIG_IGN);
    signal(SIGPIPE, SIG_IGN);
 
-   useseqnum = use_seqnum;
-   useprocid = use_procid;
+   if ((recfn && *recfn) || (prtcfn && *prtcfn)) {
+      vector<unsigned> emptyvec;
+      if (!ipaddrs)
+         ipaddrs = &emptyvec;
+      if (!netmasks)
+         netmasks = &emptyvec;
+      if (!netaddrs)
+         netaddrs = &emptyvec;
+
+      ERecorder* er = nullptr;
+      if (recfn && *recfn)
+         er =  new ERecorder(recfn, *ipaddrs, *netmasks, *netaddrs);
+      eConsumer = new EConsumer(lookupProc, summarizeFiles, summarizeEP, 
+                                sortByFreq, er);
+      if (prtcfn && *prtcfn) {
+         auto eprinter = new EPrinter(eConsumer, cofp, true, prt_musec_ts,
+                                      lookupProc, lookupProc);
+         // If we are looking up proc, then existingsubj and existingobj
+         // entries will have useful info. If not, might as well elide them.
+         eConsumer->enroll(eprinter, true);
+      }
+   }
 }
 
 void
 parser_finish() {
-   if (ofp) {
-      fputc('\n', ofp);
-      fflush(ofp);
+   if (pofp) {
+      fputc('\n', pofp);
+      fflush(pofp);
+   }
+   if (eConsumer) {
+      eConsumer->finalize();
+      eConsumer->prtSum();
+      delete eConsumer;
+   }
+   if(verifyLog) {
+      clear_and_free_verifier_signing_keys(verifier_signing_keys_lo);
+      clear_and_free_verifier_signing_keys(verifier_signing_keys_hi);
    }
 
-   fprintf(stderr, "****************************** Summary from Parser "
-           "*****************************\n");
-   fprintf(stderr, 
+   fprintf(stderr, "############################## Summary from Parser "
+           "#############################\n");
+   fprintf(stderr,
       "Syscalls enters=%ld, exits=%ld, exits with errors=%ld\n"
       "Records: time=%ld, sync=%ld, corrupted=%ld, truncated str=%ld, data=%ld\n",
       entry_rec-tsdiff_rec-tsms_rec, exit_rec, exit_errs,
       tsms_rec+tsms_rec1, tsdiff_rec, err_rec, trunc_fn, trunc_data);
-   prtSortedCounts(sc_count, scname, 255, "Scall", "Counts of Syscalls", width);
-   prtSortedCounts(scexit_count, scname, 255, "Scall", "Syscall exits", width);
-   fprintf(stderr, "Out of order records: %ld, average backward slip %g seconds\n", 
+   prtSortedCounts(sc_count, scname, 255,
+      "Scall", "Counts of Syscalls", width);
+   prtSortedCounts(scexit_count, scname, 255,
+      "Scall", "Syscall exits", width);
+   fprintf(stderr, 
+      "Out of order records: %ld, average backward slip %g seconds\n",
            n_out_of_order, t_out_of_order/(1e9*n_out_of_order));
    if (skipped >0 || err_rec > 0)
-      fprintf(stderr, "Read %ld bytes, skipped %ld bytes due to errors\n",
+      fprintf(stderr,
+         "Read %ld bytes, skipped %ld bytes due to errors\n",
               nr, skipped);
 
    if (tamper_windows > 0) {
-      fprintf(stderr, "Tamper window: %g syscalls (%g critical, %g important)\n",
-              tamper_count/(double)tamper_windows, 
+      fprintf(stderr, "************** Tamper window: %g syscalls "
+           "(%g critical, %g important)\n",
+              tamper_count/(double)tamper_windows,
               tamper_ccount/(double)tamper_windows,
               tamper_icount/(double)tamper_windows);
-      fprintf(stderr, "Max tamper window duration was %gms (%gms critical,"
-              " %gms important)\n",
-              tamper_maxlag/1e6, tamper_maxclag/1e6, tamper_maxilag/1e6);
+      fprintf(stderr, "Max tamper window %gms (%gms critical,"
+              " %gms important), %ld samples\n", tamper_maxlag/1e6, 
+              tamper_maxclag/1e6, tamper_maxilag/1e6, tamper_windows);
             tamper_totclag += tamper_thisclag;
             tamper_thisclag = 0;
-      fprintf(stderr, "Average tamper window duration was %gms (%gms critical,"
+      fprintf(stderr, "Avg tamper window %gms (%gms critical,"
               " %gms important)\n",
-              tamper_totlag/(1e6*tamper_windows), 
+              tamper_totlag/(1e6*tamper_windows),
               tamper_totclag/(1e6*tamper_windows),
               tamper_totilag/(1e6*tamper_windows));
-      fprintf(stderr, 
-              "Windows: %ld, Events: critical %lu, important %lu, all %lu, "
-              "max lag=%gms\n", tamper_windows, tamper_totclag, tamper_totilag, 
-              tamper_totlag, max_kernel_ts_clk_kernel_diff/1e6);
-      cerr << "Histograms: ";
+/*
+      cerr << " ------------ Histograms (time in microseconds): --------------\n";
+      cerr << "Sampling periods: ";
+      tamper_period.print(cerr);
+      cerr << "All syscalls: ";
       tamperlag.print(cerr);
-      cerr << "\nCritical: ";
+      cerr << "Critical: ";
       tamperclag.print(cerr);
-      cerr << "\nImportant: ";
+      cerr << "Important: ";
       tamperilag.print(cerr);
       cerr << endl;
+*/
+   if (log_tampered) {
+      fprintf(stderr, "************** No of events tampered: %d **************\n",
+              n_tampered_events);
+      fflush(stderr);
+   }
+
    }
 }
 
-int parseCmdlineAndProcInput(int argc, char* argv[]) {
-   bool do_print;
-   bool use_seqnum, use_procid, auditRdWr, logOpen, summarizeFiles, summarizeEP;
-   bool sortByFreq;
-   const char *infn, *prtfn, *recfn;
-   vector<unsigned> *ipaddrs, *netmasks, *netaddrs;
-
-   parseCmdline(argc, argv, infn, do_print, prtfn, recfn, use_seqnum, use_procid,
-                auditRdWr, logOpen, summarizeFiles, summarizeEP, 
-                sortByFreq, ipaddrs, netmasks, netaddrs);
-   if (do_print && !prtfn)
-      prtfn = strdup("-");
-   parser_init(infn, prtfn, recfn, use_seqnum, use_procid, 
-               auditRdWr, logOpen, summarizeFiles, summarizeEP, sortByFreq, 
-               ipaddrs, netmasks, netaddrs);
-   
+int parseCmdLineAndProcInput(int argc, const char* argv[]) {
+   parseCmdLine(argc, argv);
+   parser_init();
    parse_stream();
    parser_finish();
    return 0;

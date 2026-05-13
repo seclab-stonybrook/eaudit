@@ -1,10 +1,3 @@
-//cpp header file to declare classes and functions
-//the logic is, we are only declaring one function
-//to create logs. Python will only call this. Internally
-//in the implementation, we'd use the recordString argument
-//of this function to initialize auditconsumer, and call
-//the ultimate printing function inside it. 
-
 #pragma once
 #ifdef __cplusplus
     #include <cstdint>
@@ -26,14 +19,14 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-EXPORT_SYMBOL int logprinter(void* _x, void *log_buf, int sz);
-EXPORT_SYMBOL size_t nread();
-EXPORT_SYMBOL size_t nwritten();
-EXPORT_SYMBOL size_t dowrite();
-EXPORT_SYMBOL size_t calls();
-EXPORT_SYMBOL size_t init_consumer(const char* capture_fn, const char* prt_fn,
-                                     const char* record_fn);
-EXPORT_SYMBOL size_t end_op();
+EXPORT_SYMBOL long init_consumer(int argc, const char* argv[]);
+EXPORT_SYMBOL long logprinter(void* _x, void *log_buf, int sz);
+EXPORT_SYMBOL long dowrite(); // Same return value as ncalls
+EXPORT_SYMBOL long end_op();
+
+EXPORT_SYMBOL long calls();   // Returns the number of calls to logprinter
+EXPORT_SYMBOL long nread();
+EXPORT_SYMBOL long nwritten();
 #ifdef __cplusplus
 }
 #endif

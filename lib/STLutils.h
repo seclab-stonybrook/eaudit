@@ -1,24 +1,7 @@
-/*******************************************************************************
- *  Copyright 2022-23 R. Sekar and Secure Systems Lab, Stony Brook University
- *******************************************************************************
- * This file is part of eAudit.
- *
- * eAudit is free software: you can redistribute it and/or modify it under the
- * terms of the GNU General Public License as published by the Free Software
- * Foundation, either version 3 of the License, or (at your option) any later
- * version.
- *
- * eAudit is distributed in the hope that it will be useful, but WITHOUT ANY
- * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
- * A PARTICULAR PURPOSE. See the GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * eAudit. If not, see <https://www.gnu.org/licenses/>.
- ******************************************************************************/
-
 #ifndef STL_UTILS_H
 #define STL_UTILS_H
 
+#include <algorithm>
 #include <tuple>
 #include <vector>
 #include <string>
@@ -28,6 +11,9 @@
 #include <vector>
 #include <list>
 #include <map>
+#include <iostream>
+#include <sstream>
+
 #include <limits.h>
 #include "FastHash.h"
 #include "Base.h"
@@ -147,6 +133,9 @@ namespace std {
     namespace
     {
 
+        /* I am unconvinced by this combination function. Golden ratio
+           it seems!
+
         // Code from boost
         // Reciprocal of the golden ratio helps spread entropy
         //     and handles duplicates.
@@ -158,6 +147,29 @@ namespace std {
         {
             seed ^= std::hash<T>()(v) + 0x9e3779b9 + (seed<<6) + (seed>>2);
         }
+        */
+
+        // When used in a typical fashion, e.g., on a vector [an,...,a0],
+        // yields sum_{i=0}{n} a_i x^i
+        template <class T>
+        inline void hash_combine_asymm(std::size_t& seed, T const& v) {
+            constexpr size_t x = 7892540079625801679ul; // some random odd?
+            size_t vh = std::hash<T>()(v);
+            seed += x*seed + vh;
+        }
+
+        // Hash combo for unordered collections [an,...,a0]. The result is
+        // prod_{i|odd(a_i)} (a_i + x) * prod_{j|even(a_j)} ~(a_j+x)
+
+        template <class T>
+        inline void hash_combine_symm(std::size_t& seed, T const& v) {
+           assert_abort(seed != 0);
+            constexpr size_t x = 7277111512771247327ul; // some random odd
+            size_t vh = x + std::hash<T>()(v);
+            if (!(vh&0x1))
+               vh = ~vh;
+            seed *= vh;
+        }
 
         // Recursive template code derived from Matthieu M.
         template <class Tuple, size_t Index = std::tuple_size<Tuple>::value - 1>
@@ -166,7 +178,7 @@ namespace std {
           static void apply(size_t& seed, Tuple const& tuple)
           {
             HashValueImpl<Tuple, Index-1>::apply(seed, tuple);
-            hash_combine(seed, std::get<Index>(tuple));
+            hash_combine_asymm(seed, std::get<Index>(tuple));
           }
         };
 
@@ -175,7 +187,7 @@ namespace std {
         {
           static void apply(size_t& seed, Tuple const& tuple)
           {
-            hash_combine(seed, std::get<0>(tuple));
+            hash_combine_asymm(seed, std::get<0>(tuple));
           }
         };
     }
@@ -198,10 +210,8 @@ namespace std {
    public:
       size_t operator()(const vector<T>& t) const {
          size_t tc[t.size()]; unsigned j=0;
-         for (const T& v: t) {
-            std::hash<T> x;
-            tc[j++] = x(v);
-         }
+         for (const T& v: t) 
+            tc[j++] = std::hash<T>()(v);
          return fasthash64(&tc[0], t.size()*sizeof(size_t), t.size());
       }
    };
@@ -211,10 +221,8 @@ namespace std {
    public:
       size_t operator()(const set<T>& t) const {
          size_t tc[t.size()]; unsigned j=0;
-         for (const T& v: t) {
-            std::hash<T> x;
-            tc[j++] = x(v);
-         }
+         for (const T& v: t)
+            tc[j++] = std::hash<T>()(v);
          return fasthash64(&tc[0], t.size()*sizeof(size_t), t.size());
       }
    };
@@ -224,7 +232,7 @@ namespace std {
    public:
       size_t operator()(const pair<T1, T2>& t) const {
          size_t rv = hash<T1>()(t.first);
-         hash_combine(rv, t.second);
+         hash_combine_asymm(rv, t.second);
          return rv;
       }
    };
@@ -233,10 +241,11 @@ namespace std {
    struct hash<unordered_map<T1, T2>> {
    public:
       size_t operator()(const unordered_map<T1, T2>& t) const {
-         size_t rv = t.size();
+         size_t rv = t.size()+1; // shd be nonzero now
          for (auto& kv: t) {
-            hash_combine(rv, hash<T1>()(kv.first));
-            hash_combine(rv, hash<T2>()(kv.second));
+            size_t kvh = hash<T1>()(kv.first);
+            hash_combine_asymm(kvh, hash<T2>()(kv.second));
+            hash_combine_symm(rv, kvh);
          }
          return rv;
       }
@@ -246,9 +255,9 @@ namespace std {
    struct hash<unordered_set<T>> {
    public:
       size_t operator()(const unordered_set<T>& t) const {
-         size_t rv = t.size();
+         size_t rv = t.size()+1;
          for (auto& s: t)
-            hash_combine(rv, hash<T>()(s));
+            hash_combine_symm(rv, hash<T>()(s));
          return rv;
       }
    };
@@ -391,6 +400,53 @@ sanitize(const char* in, const char* escape="", int min=' ', int max='~') {
 inline string 
 sanitize(string in, const char* escape="", int min=' ', int max='~') {
    return sanitize(in.data(), escape, min, max);
+}
+
+// This returns in the same fashion as <=>: negative means a < b, positive means a > b, zero means a == b
+// We compare first by size, ensuring that our ordering is a linear extension of the subset relation
+template<class T>
+int cmp_set(const unordered_set<T>& a, const unordered_set<T>& b) {
+    if (a.size() - b.size()) return a.size() - b.size();
+    vector<T> vec_a(a.begin(), a.end()), vec_b(b.begin(), b.end());
+    // pop and compare minimums
+    make_heap(vec_a.begin(), vec_a.end(), greater<T>());
+    make_heap(vec_b.begin(), vec_b.end(), greater<T>());
+    auto heap_end_a = vec_a.end(), heap_end_b = vec_b.end();
+    for (unsigned ct = 0; ct < a.size(); ct++) {
+        if (*vec_a.begin() > *vec_b.begin()) return +1;
+        else if (*vec_a.begin() < *vec_b.begin()) return -1;
+        pop_heap(vec_a.begin(), heap_end_a--, greater<T>());
+        pop_heap(vec_b.begin(), heap_end_b--, greater<T>());
+    }
+    return 0;
+}
+
+template<class K, class V>
+int cmp_dict(const unordered_map<K, V>& a, const unordered_map<K, V>& b) {
+    if (a.size() - b.size()) return a.size() - b.size();
+    vector<K> vec_a, vec_b;
+    for (auto it = a.begin(); it != a.end(); ++it)
+        vec_a.push_back(it->first);
+    for (auto it = b.begin(); it != b.end(); ++it)
+        vec_b.push_back(it->first);
+    // pop and compare minimum keys (same code as above)
+    make_heap(vec_a.begin(), vec_a.end(), greater<K>());
+    make_heap(vec_b.begin(), vec_b.end(), greater<K>());
+    auto heap_end_a = vec_a.end(), heap_end_b = vec_b.end();
+    for (unsigned ct = 0; ct < a.size(); ct++) {
+        if (*vec_a.begin() > *vec_b.begin()) return +1;
+        else if (*vec_a.begin() < *vec_b.begin()) return -1;
+        pop_heap(vec_a.begin(), heap_end_a--, greater<K>());
+        pop_heap(vec_b.begin(), heap_end_b--, greater<K>());
+    }
+    // compare by values (vec_a and vec_b are now sorted in descending order, so we iterate in reverse)
+    auto i = vec_a.rbegin(); auto j = vec_b.rbegin();
+    for (unsigned ct = 0; ct < a.size(); ct++) {
+        if (a.at(*i) > b.at(*j)) return +1;
+        else if (a.at(*i) < b.at(*j)) return -1;
+        ++i; ++j;
+    }
+    return 0;
 }
 
 #endif
