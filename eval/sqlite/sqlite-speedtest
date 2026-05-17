@@ -1,0 +1,8 @@
+#!/bin/sh
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$script_dir/sqlite" || exit 1
+LOG_FILE="speedtest_output.log"
+./speedtest1 "$@" > "$LOG_FILE" 2>&1
+status=$?
+echo $status > ~/test-exit-status
+exit $status

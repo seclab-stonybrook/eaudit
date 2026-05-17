@@ -1,10 +1,10 @@
-lt_eaudit --> Measures the log tampering window of eAudit. For info
-on how to run it, look at the usage documentation produced
-by the script. Be aware that the script does not produce signals
-to eAudit to generate log tamper windows at runtime, contrary
-to the paper. The script will generate 4 important fields:
-the number of windows generated, avg. # of normal syscalls.
-avg. # of important syscalls, and avg. # of critical syscalls.
+lt_eaudit --> Measures the log tampering window for the eAudit paper
+evaluation. For info on how to run it, look at the usage documentation
+produced by the script. Be aware that the script does not produce signals
+to eAudit to generate log tamper windows at runtime, contrary to the paper.
+The script will generate 4 important fields: the number of windows generated,
+avg. # of normal syscalls, avg. # of important syscalls, and avg. # of
+critical syscalls.
 
 lt_sysdig --> Measures the log tampering window of sysdig-capture.
 Instructions:
@@ -18,4 +18,15 @@ called buffer_ratio. Stop sysdig-capture.
 4. Use buffer_ratio value as a parameter to run the count_recs
 script. It will print the tamper window size.
 
+high_load_tw --> Measures tamper windows for the Winseal paper evaluation
+while running a benchmark load. This script lives in log_tamper but runs
+benchmark helpers from the parent eval directory. Use -h for the full
+argument list and remote logging example.
 
+low_load_tw --> Measures tamper windows for the Winseal paper evaluation with
+only the logger running for a fixed duration. It uses the local
+log_tamper/low_load_tw_runner helper so the script can be run directly from
+this directory layout. Use -h for local and remote logging arguments.
+
+low_load_tw_runner --> Helper used by low_load_tw. Run low_load_tw directly
+for normal low-load Winseal tamper-window measurements.

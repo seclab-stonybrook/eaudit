@@ -1,28 +1,139 @@
 #!/bin/bash
 
-if (( $# < 1 || $# > 4 )); then
-    echo "Usage: $0 <datafilename> [per_cpu_buffer [wakeup_interval [max_padding]]]" && exit 1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVAL_DIR="$SCRIPT_DIR"
+
+if [[ "$1" == "-h" || "$1" == "--help" || $# -lt 1 ]]; then
+    echo "Usage: $0 <outfile> [iteration [defense [cache_time [flush_interval"
+    echo "         [ -A{0|1|2|3} ... ] [log_mode [ssh_user [ssh_server]]]]]]]"
+    echo "  outfile        : output data filename (e.g., results.csv)"
+    echo "  iteration      : integer               (default: 1)"
+    echo "  defense        : prevention|detection  (default: prevention)"
+    echo "  cache_time     : nanoseconds           (default: 670000 -- 0.67 ms)"
+    echo "  flush_interval : seconds               (default: 0.002 -- 2ms)"
+    echo "  -A flags       : any combo of -A0 -A1 -A2 -A3 (optional; defaults -A3)"
+    echo "  log_mode       : local|remote          (default: local)"
+    echo "  ssh_user       : required if remote"
+    echo "  ssh_server     : required if remote"
+    echo ""
+    echo "Benchmark groups:"
+    echo "  Previous eAudit: run_find, run_tar, run_shbm, run_rdwr, run_pm,"
+    echo "                   run_httperf, run_kernbuild"
+    echo "  Winseal:        run_pm, run_httperf, run_sqlite, run_redis"
+    exit 1
 fi
 
 outfile="$1"
-per_cpu_buffer=$2
-wakeup_interval=$3
-max_padding=${4:-0}
+iteration="${2:-1}"
+defense="${3:-prevention}"
+cache_time="${4:-670000}"
+flush_interval="${5:-0.002}"
+
+# ---- Parse tail: algorithms (-A*) then log_mode then optional ssh creds ----
+rest=( "${@:6}" )
+
+declare -a algos=()
+declare -A _seen=()
+log_mode="local"
+user=""
+server=""
+
+i=0
+stage="algos"
+while (( i < ${#rest[@]} )); do
+  tok="${rest[$i]}"
+
+  if [[ "$stage" == "algos" ]]; then
+    # Accept "-A 0..3"
+    if [[ "$tok" == "-A" ]]; then
+      if (( i+1 < ${#rest[@]} )) && [[ "${rest[$((i+1))]}" =~ ^[0-3]$ ]]; then
+        key="-A${rest[$((i+1))]}"
+        if [[ -z "${_seen[$key]+x}" ]]; then algos+=("$key"); _seen[$key]=1; fi
+        (( i+=2 )); continue
+      else
+        echo "Error: '-A' must be followed by 0..3" >&2; exit 1
+      fi
+    fi
+    # Accept compact "-A0..-A3"
+    if [[ "$tok" =~ ^-A[0-3]$ ]]; then
+      key="$tok"
+      if [[ -z "${_seen[$key]+x}" ]]; then algos+=("$key"); _seen[$key]=1; fi
+      (( i++ )); continue
+    fi
+    # First non -A token -> treat as log_mode
+    stage="mode"; continue
+  fi
+
+  if [[ "$stage" == "mode" ]]; then
+    if [[ -z "${tok:-}" ]]; then (( i++ )); continue; fi
+    if [[ "$tok" == "local" || "$tok" == "remote" ]]; then
+      log_mode="$tok"; stage="ssh_user"; (( i++ )); continue
+    else
+      echo "Error: expected log_mode ('local'|'remote'), got '$tok'." >&2
+      exit 1
+    fi
+  fi
+
+  if [[ "$stage" == "ssh_user" ]]; then
+    if [[ "$log_mode" == "remote" ]]; then
+      user="$tok"; stage="ssh_server"; (( i++ )); continue
+    else
+      echo "Error: unexpected extra arg '$tok' after log_mode=local." >&2
+      exit 1
+    fi
+  fi
+
+  if [[ "$stage" == "ssh_server" ]]; then
+    server="$tok"; stage="done"; (( i++ )); continue
+  fi
+
+  echo "Error: unexpected extra arg '$tok' after ssh_server." >&2
+  exit 1
+done
+
+# Defaults / validation (minimal)
+(( ${#algos[@]} == 0 )) && algos=( "-A3" )
+
+# Baseline eAudit should be evaluated with -A0. In this codebase, A0 is the
+# self-flushing algorithm that the original eAudit configuration works with.
+
+if [[ "$log_mode" == "remote" ]]; then
+  if [[ -z "${user:-}" || -z "${server:-}" ]]; then
+    echo "Error: remote logging selected but ssh_user and/or ssh_server missing." >&2
+    exit 1
+  fi
+fi
 
 if [[ "${outfile##*.}" != "csv" ]]; then
     echo "data file name should have a csv suffix" && exit 1
 fi
 
-if [[ -f $outfile ]]; then
-    echo "refusing to overwrite an existing data file" && exit 1
-fi
+# if [[ -f $outfile ]]; then
+#     echo "refusing to overwrite an existing data file" && exit 1
+# fi
 
-./bmrun $outfile run_find 288 $max_padding $per_cpu_buffer $wakeup_interval
-./bmrun $outfile run_tar 144 $max_padding $per_cpu_buffer $wakeup_interval
-./bmrun $outfile run_shbm 200000 $max_padding $per_cpu_buffer $wakeup_interval
-./bmrun $outfile run_rdwr 100000000 $max_padding $per_cpu_buffer $wakeup_interval
-./bmrun $outfile "run_pm pm-config.sm" 24 $max_padding $per_cpu_buffer $wakeup_interval
-./bmrun $outfile run_httperf 3000 $max_padding $per_cpu_buffer $wakeup_interval
-./bmrun $outfile run_kernbuild 1 $max_padding $per_cpu_buffer $wakeup_interval
+# Previous eAudit evaluation benchmarks.
+"$EVAL_DIR/bmrun" "$outfile" run_find 288 1.6 8 "$iteration" "$defense" "$cache_time" "$flush_interval" \
+  "${algos[@]}" "$log_mode" $user $server
+"$EVAL_DIR/bmrun" "$outfile" run_tar 144 1.6 8 "$iteration" "$defense" "$cache_time" "$flush_interval" \
+  "${algos[@]}" "$log_mode" $user $server
+"$EVAL_DIR/bmrun" "$outfile" run_shbm 200000 1.6 8 "$iteration" "$defense" "$cache_time" "$flush_interval" \
+  "${algos[@]}" "$log_mode" $user $server
+"$EVAL_DIR/bmrun" "$outfile" run_rdwr 100000000 1.6 8 "$iteration" "$defense" "$cache_time" "$flush_interval" \
+  "${algos[@]}" "$log_mode" $user $server
+"$EVAL_DIR/bmrun" "$outfile" "run_pm pm-config.sm" 24 1.6 8 "$iteration" "$defense" "$cache_time" "$flush_interval" \
+  "${algos[@]}" "$log_mode" $user $server
+"$EVAL_DIR/bmrun" "$outfile" run_httperf 3000 1.6 8 "$iteration" "$defense" "$cache_time" "$flush_interval" \
+  "${algos[@]}" "$log_mode" $user $server
+"$EVAL_DIR/bmrun" "$outfile" run_kernbuild 1 1.6 8 "$iteration" "$defense" "$cache_time" "$flush_interval" \
+  "${algos[@]}" "$log_mode" $user $server
 
-
+# Winseal evaluation benchmarks.
+"$EVAL_DIR/bmrun" "$outfile" "run_pm pm-config.sm" 9 1.6 8 "$iteration" "$defense" \
+"$cache_time" "$flush_interval" "${algos[@]}" "$log_mode" $user $server
+"$EVAL_DIR/bmrun" "$outfile" run_httperf 1000 1.6 8 "$iteration" "$defense" "$cache_time" "$flush_interval" \
+  "${algos[@]}" "$log_mode" $user $server
+"$EVAL_DIR/bmrun" "$outfile" run_sqlite 100 1.6 8 "$iteration" "$defense" "$cache_time" "$flush_interval" \
+  "${algos[@]}" "$log_mode" $user $server
+"$EVAL_DIR/bmrun" "$outfile" run_redis 1000000 1.6 8 "$iteration" "$defense" "$cache_time" "$flush_interval" \
+  "${algos[@]}" "$log_mode" $user $server

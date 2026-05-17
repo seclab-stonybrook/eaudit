@@ -1,10 +1,13 @@
 
 
-**eAudit** is compatible with recent Linux distributions. It is based on the
+**eAudit** and **Winseal** are compatible with recent 
+Linux distributions. They are based on the
 BCC toolkit for developing ebpf applications. Although BCC may be available
 as a binary package, it is preferable to install it from source. This is because
 the binary packages can be years behind the current version and hence may not 
-be compatible with **eAudit**. 
+be compatible with **eAudit** and **Winseal**. 
+Use the latest version of BCC from: https://github.com/iovisor/bcc
+
 
 One way to check if you already have BCC is to run **ecapd**, e.g., issue the
 following commands from the top-level **eaudit** directory:

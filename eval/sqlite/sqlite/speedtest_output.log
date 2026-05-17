@@ -1,0 +1,34 @@
+-- Speedtest1 for SQLite 3.30.0 2019-10-04 15:03:17 c20a35336432025445f9f7e289d0cc
+ 100 - 5000 INSERTs into table with no index.......................    0.024s
+ 110 - 5000 ordered INSERTS with one index/PK......................    0.022s
+ 120 - 5000 unordered INSERTS with one index/PK....................    0.039s
+ 130 - 25 SELECTS, numeric BETWEEN, unindexed......................    0.015s
+ 140 - 10 SELECTS, LIKE, unindexed.................................    0.023s
+ 142 - 10 SELECTS w/ORDER BY, unindexed............................    0.038s
+ 145 - 10 SELECTS w/ORDER BY and LIMIT, unindexed..................    0.024s
+ 150 - CREATE INDEX five times.....................................    0.027s
+ 160 - 1000 SELECTS, numeric BETWEEN, indexed......................    0.009s
+ 161 - 1000 SELECTS, numeric BETWEEN, PK...........................    0.010s
+ 170 - 1000 SELECTS, text BETWEEN, indexed.........................    0.021s
+ 180 - 5000 INSERTS with three indexes.............................    0.032s
+ 190 - DELETE and REFILL one table.................................    0.026s
+ 200 - VACUUM......................................................    0.037s
+ 210 - ALTER TABLE ADD COLUMN, and query...........................    0.001s
+ 230 - 1000 UPDATES, numeric BETWEEN, indexed......................    0.009s
+ 240 - 5000 UPDATES of individual rows.............................    0.015s
+ 250 - One big UPDATE of the whole 5000-row table..................    0.005s
+ 260 - Query added column after filling............................    0.001s
+ 270 - 1000 DELETEs, numeric BETWEEN, indexed......................    0.017s
+ 280 - 5000 DELETEs of individual rows.............................    0.018s
+ 290 - Refill two 5000-row tables using REPLACE....................    0.062s
+ 300 - Refill a 5000-row table using (b&1)==(a&1)..................    0.031s
+ 310 - 1000 four-ways joins........................................    0.036s
+ 320 - subquery in result set......................................    0.031s
+ 400 - 7000 REPLACE ops on an IPK..................................    0.047s
+ 410 - 7000 SELECTS on an IPK......................................    0.029s
+ 500 - 7000 REPLACE on TEXT PK.....................................    0.045s
+ 510 - 7000 SELECTS on a TEXT PK...................................    0.021s
+ 520 - 7000 SELECT DISTINCT........................................    0.011s
+ 980 - PRAGMA integrity_check......................................    0.037s
+ 990 - ANALYZE.....................................................    0.006s
+       TOTAL.......................................................    0.754s

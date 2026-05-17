@@ -18,134 +18,345 @@
 # eAudit. If not, see <https://www.gnu.org/licenses/>.
 #****************************************************************************
 
-core_ct=`nproc`
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVAL_DIR="$SCRIPT_DIR"
+ROOT_DIR="$(cd "$EVAL_DIR/.." && pwd)"
+
+core_ct=8
 iterations=1
 pcpu_buf=1.6
 wakeup_int=8
-max_padding=160
-bmark_cmd="run_pm pm-config.sm"
+bmark_cmd="run_redis"
 bmark_loops=$core_ct
 rbuf=16
+defense="prevention"
+cache_time=670000
+flush_interval=0.002
+log_mode="local"
+ssh_user=""
+ssh_server=""
 
-if [[ $# == 0 || "x$1" == 'x-h' || "x$1" == 'x-help' || "x$1" == 'x--help' ]]; then
-   echo "Usage: $0 outfile [benchmark_cmd [benchmark_loops [max_padding "
-   echo "                       [per_cpu_buffer [wakeup_interval [iterations]]]]]]"
-   echo "Defaults: benchmark_cmd=$bmark_cmd, benchmark_loops=$bmark_loops, max_padding=$max_padding, "
-   echo "          per_cpu_buffer=$pcpu_buf, wakeup_interval=$wakeup_int, iterations=$iterations"
+# Help / usage
+if (( $# == 0 )) || [[ "$1" == "-h" || "$1" == "--help" || "$1" == "help" ]]; then
+   echo "Usage:"
+   echo "  $0 outfile [benchmark_cmd [benchmark_loops [per_cpu_buffer [wakeup_interval"
+   echo "      [iterations [defense [cache_time [flush_interval [ -A{0|1|2|3} ... ]"
+   echo "      [log_mode [ssh_user [ssh_server]]]]]]]]]]"
+   echo ""
+   echo "Defaults:"
+   echo "  benchmark_cmd=$bmark_cmd"
+   echo "  benchmark_loops=$bmark_loops"
+   echo "  per_cpu_buffer=$pcpu_buf"
+   echo "  wakeup_interval=$wakeup_int"
+   echo "  iterations=$iterations"
+   echo "  defense=$defense"
+   echo "  cache_time=$cache_time"
+   echo "  flush_interval=$flush_interval"
+   echo ""
+   echo "Arguments after the 9th are parsed robustly as:"
+   echo "  one or more algorithm flags:  -A0  -A 1  -A2  -A3  (any combo/order)"
+   echo "  then: log_mode:               local | remote"
+   echo "  then: (if remote)             ssh_user ssh_server"
+   echo ""
+   echo "Examples:"
+   echo "  Local :  $0 out.csv run_redis 8 1.6 8 1 prevention 670000 0.002 -A0 -A3 local"
+   echo "  Remote:  $0 out.csv run_redis 8 1.6 8 1 detection 670000 0.002 -A1 -A2 remote winseal logs.example.com"
    exit 1
 fi
 
 outfile="$1"
 bmark_cmd=${2:-$bmark_cmd}
 bmark_loops=${3:-$bmark_loops}
-max_padding=${4:-$max_padding}
-pcpu_buf=${5:-$pcpu_buf}
-wakeup_int=${6:-$wakeup_int}
-iterations=${7:-$iterations}
+pcpu_buf=${4:-$pcpu_buf}
+wakeup_int=${5:-$wakeup_int}
+iterations=${6:-$iterations}
+defense=${7:-$defense}
+cache_time=${8:-$cache_time}
+flush_interval=${9:-$flush_interval}
+
+# ---- Parse from arg 10 onward: any number of -A flags, then log_mode, then ssh creds ----
+rest=( "${@:10}" )
+
+declare -a param_configs=()
+declare -A _seen=()
+
+log_mode_set=""
+ssh_user_set=""
+ssh_server_set=""
+
+i=0
+while (( i < ${#rest[@]} )); do
+  tok="${rest[$i]}"
+
+  # Accept -A0..-A3 or "-A 0..3"
+  if [[ "$tok" == "-A" ]]; then
+    if (( i+1 < ${#rest[@]} )) && [[ "${rest[$((i+1))]}" =~ ^[0-3]$ ]]; then
+      key="-A ${rest[$((i+1))]}"
+      if [[ -z "${_seen[$key]+x}" ]]; then param_configs+=("$key"); _seen[$key]=1; fi
+      (( i+=2 ))
+      continue
+    else
+      echo "Error: '-A' must be followed by 0..3" >&2
+      exit 1
+    fi
+  elif [[ "$tok" =~ ^-A[0-3]$ ]]; then
+    key="-A ${tok:2:1}"
+    if [[ -z "${_seen[$key]+x}" ]]; then param_configs+=("$key"); _seen[$key]=1; fi
+    (( i++ ))
+    continue
+  fi
+
+  # First non -A token is log_mode
+  if [[ -z "$log_mode_set" ]]; then
+    if [[ "$tok" != "local" && "$tok" != "remote" ]]; then
+      echo "Error: expected log_mode ('local'|'remote'), got '$tok'." >&2
+      exit 1
+    fi
+    log_mode="$tok"; log_mode_set=1
+    (( i++ ))
+    continue
+  fi
+
+  # If remote, expect user and server
+  if [[ "$log_mode" == "remote" && -z "$ssh_user_set" ]]; then
+    ssh_user="$tok"; ssh_user_set=1; (( i++ )); continue
+  fi
+  if [[ "$log_mode" == "remote" && -z "$ssh_server_set" ]]; then
+    ssh_server="$tok"; ssh_server_set=1; (( i++ )); continue
+  fi
+
+  # Anything extra is an error
+  echo "Error: unexpected extra arg '$tok' after ssh_server." >&2
+  exit 1
+done
+
+# Default algorithm if none provided
+if (( ${#param_configs[@]} == 0 )); then
+  param_configs=("-A 3")
+fi
+
+# Validate remote creds if needed
+if [[ "$log_mode" == "remote" ]] && { [[ -z "${ssh_user:-}" ]] || [[ -z "${ssh_server:-}" ]]; }; then
+  echo "Error: remote log_mode requires <ssh_user> <ssh_server>." >&2
+  exit 1
+fi
+
+require_sudo() {
+    if (( "$(id -u)" != 0 )); then
+        sudo -v || {
+            echo "sudo authentication failed; aborting before starting benchmark/logger" >&2
+            exit 1
+        }
+    fi
+}
+
+require_sudo
+
 bmark_nm=$(echo "$bmark_cmd" | awk '{print $1}')
 
 logfile="/tmp/$outfile.log"
 bmoutfile="/tmp/$outfile.bm"
 agoutfile="/tmp/$outfile.ag"
 diag_prefix="eaudit_diagnostic:"
+parserFile="/tmp/$outfile.prt"
+log_config="$logfile"
 
-( cd .. && make all ) || exit 1 
-
+( cd "$ROOT_DIR" && make all ) || exit 1
+if [ "$defense" = "detection" ]; then
+    ( cd "$ROOT_DIR" && make eauditd-tamper ) || exit 1
+fi
 if [[ "${outfile##*.}" != "csv" ]]; then
     echo "outfile should have a csv suffix" && exit 1
 fi
 
+# ---- Timing helpers (capture for ohead) ----
+LAST_ELAPSED=""
+LAST_USER=""
+LAST_SYS=""
+BASE_BM_WALL=""
+BM_WALL_VAL=""
+
 bmark_stats() {
-  elapsedt=`egrep -a ^real $bmoutfile | awk 'NR==1 {print $2}' | awk '{print (($1 * 60) + $2)}' FS='m'`;
-  usert=`grep -a ^user $bmoutfile | awk 'NR==1 {print $2}' | awk '{print (($1 * 60) + $2)}' FS='m'`;
-  syst=`grep -a ^sys $bmoutfile | awk 'NR==1 {print $2}' | awk '{print (($1 * 60) + $2)}' FS='m'`;
-  echo -n "$elapsedt,$usert,$syst," >> $outf
+  elapsedt=$(egrep -a ^real "$bmoutfile" | awk 'NR==1 {print $2}' | awk -F'm' '{gsub("s","",$2); print ($1*60)+$2}')
+  usert=$(grep -a ^user "$bmoutfile" | awk 'NR==1 {print $2}' | awk -F'm' '{gsub("s","",$2); print ($1*60)+$2}')
+  syst=$(grep -a ^sys  "$bmoutfile" | awk 'NR==1 {print $2}' | awk -F'm' '{gsub("s","",$2); print ($1*60)+$2}')
+
+  LAST_ELAPSED="$elapsedt"
+  LAST_USER="$usert"
+  LAST_SYS="$syst"
+
+  # echo -n "$elapsedt,$usert,$syst,"
+  echo -n "$elapsedt,$usert,$syst," >> "$outf"
 }
 
 bmark() {
-    # echo ./$*
-    ./$* >& $bmoutfile
+    echo "rx:./$*"
+    ( cd "$EVAL_DIR" && ./$* >& "$bmoutfile" )
     bmark_stats
 }
 
 agent_stats() {
-    # Truncates minutes field, fix if runs are really long !!!!
-    usert=`grep -a user $agoutfile | awk '{print $1}' FS='user'`;
-    syst=`grep -a user $agoutfile | awk '{print $2}' FS=' ' | awk '{print $1}' FS='system'`;
-    echo -n "$usert,$syst," >> $outf
+    usert=$(grep -a user "$agoutfile" | awk '{print $1}' FS='user')
+    syst=$(grep -a user "$agoutfile" | awk '{print $2}' FS=' ' | awk '{print $1}' FS='system')
+    elapsedt=$(grep -a user "$agoutfile" | awk '{print $3}' FS=' ' | awk '{print $1}' FS='elapsed' | awk -F':' '{print ($1*60)+$2}')
+    echo -n "$usert,$syst,$elapsedt," >> "$outf"
 
     if (( $# > 1 )); then
-        syscalls=$(grep -a ${diag_prefix}syscalls $agoutfile | awk '{print $2}' )
-        lost=$(grep -a ${diag_prefix}lost $agoutfile | awk '{print $2}' )
-        avgcallsize=$(grep -a ${diag_prefix}avgcallsize $agoutfile| awk '{print $2}')
-        avgcachesize=$(grep -a \
-                      ${diag_prefix}avgcachesize $agoutfile | awk '{print $2}' )
-        avgp=$(grep -a ${diag_prefix}avgp $agoutfile | awk '{print $2}' )
-        avgw=$(grep -a ${diag_prefix}avgw $agoutfile | awk '{print $2}' )
-        echo -n "$syscalls,$lost,$avgcallsize,$avgcachesize,$avgp,$avgw," \
-             >> $outf
+        syscalls=$(grep -a "${diag_prefix}syscalls" "$agoutfile" | awk '{print $2}')
+        sent=$(grep -a "${diag_prefix}sent" "$agoutfile" | awk '{print $2}')
+        lost=$(grep -a "${diag_prefix}lost" "$agoutfile" | awk '{print $2}')
+        avgcallsize=$(grep -a "${diag_prefix}avgcallsize" "$agoutfile" | awk '{print $2}')
+        avgcachesize=$(grep -a "${diag_prefix}avgcachesize" "$agoutfile" | awk '{print $2}')
+        avgp=$(grep -a "${diag_prefix}avgp" "$agoutfile" | awk '{print $2}')
+        avgw=$(grep -a "${diag_prefix}avgw" "$agoutfile" | awk '{print $2}')
+        echo -n "$syscalls,$sent,$lost,$avgcallsize,$avgcachesize,$avgp,$avgw," >> "$outf"
     fi
 }
 
 agent() {
-    args="-m $diag_prefix -c $logfile -s -v2 -p $1 -b $pcpu_buf -r $rbuf -w $wakeup_int"
-    ( cd .. && ./ecapd $args >& $agoutfile ) &
-    sleep 15
-    agent_pid=$( ps ax| egrep -a '[0-9] python' | grep -a eauditd.py | awk '{print $1}' )
-    shift
-    if (( $# > 1 )); then
-        bmark $*
+    require_sudo
+
+    if [ "$param_config" = "-A 0" ]; then
+        args_prefix="-m $diag_prefix -s -v2 -b $pcpu_buf -r $rbuf -w $wakeup_int -C"
+        args_suffix="-- -C $log_config"
+    elif [ "$param_config" = "-A 1" ]; then
+        args_prefix="-m $diag_prefix -s -v2 -b $pcpu_buf -r $rbuf -w $wakeup_int $param_config -t $cache_time"
+        args_suffix="-- -C $log_config"
+    elif [ "$param_config" = "-A 2" ]; then
+        args_prefix="-m $diag_prefix -s -v2 -b $pcpu_buf -r $rbuf -w $wakeup_int $param_config -t $cache_time"
+        args_suffix="-- -C $log_config -f $flush_interval"
+    else
+        args_prefix="-m $diag_prefix -s -v2 -b $pcpu_buf -r $rbuf -w $wakeup_int $param_config -t $cache_time"
+        args_suffix="-- -C $log_config -f $flush_interval"
     fi
 
+    # Add -H only for detection modes that use signed shared-cache logs.
+    if [ "$defense" = "detection" ] && [ "$param_config" != "-A 0" ]; then
+        args="$args_prefix -H $args_suffix"
+    else
+        args="$args_prefix $args_suffix"
+    fi
+
+    # echo "Logger Config::$args"
+
+    ( cd "$ROOT_DIR" && ./ecapd $args >& "$agoutfile" ) &
+    agent_pid=$!
+    sleep 60
+    if ! kill -0 "$agent_pid" 2>/dev/null; then
+        echo "failed: logger exited before benchmark; see $agoutfile" >&2
+        exit 1
+    fi
+    shift
+    if (( $# > 1 )); then
+        # Running benchmark under agent ("both")
+        bmark "$@"
+        BM_WALL_VAL="$LAST_ELAPSED"
+    fi
+    require_sudo
     wrapper=sudo
-    if (( `id -u` == 0 )); then
+    if (( "$(id -u)" == 0 )); then
         wrapper=
     fi
-    $wrapper kill $agent_pid || echo "failed: $wrapper kill $agent_pid"
+
+    kill_tree() {
+        local pid="$1"
+        local child
+        for child in $(pgrep -P "$pid" 2>/dev/null); do
+            kill_tree "$child"
+        done
+        $wrapper kill "$pid" 2>/dev/null || true
+    }
+
+    kill_tree "$agent_pid"
+    wait "$agent_pid" 2>/dev/null || true
     sleep 15
-    agent_stats $*
+    agent_stats "$@"
 }
 
 loop_body() {
-    echo -n "$bmark_nm,$i,$padding,$n," >> $outf
-    echo -n "i=$i	n=$n	pad=$padding:	benchmark "
-    # Keep the total workload roughly constant, regardless of the # of cores 
-    # used: so, 1-core load iterates 12 times, while a 12-core load iterates once.
-    # Adding $n/2 to numerator meand we round rather than truncate. 
-    bmark $bmark_cmd $n $(( ($bmark_loops + $n/2)/$n ))
-    sleep 15 # Some time for caches to clear?
+    echo -n "$param_config,$log_config,$bmark_nm,$i,$n," >> "$outf"
+    echo -n "Algo=$param_config   log=$log_config    i=$i    n=$n: benchmark "
+
+    # Baseline benchmark (no agent)
+    bmark "$bmark_cmd" "$n" $(( (bmark_loops + n/2) / n ))
+    BASE_BM_WALL="$LAST_ELAPSED"
+
+    sleep 15
     echo -n "agent "
-    agent $padding
+    agent 0
+
     echo -n "both"
-    agent $padding $bmark_cmd $n $(( ($bmark_loops + $n/2)/$n ))
-    sleep 45 # Some time for caches to clear?
-    echo ""
-    echo "" >> $outf
+    agent 0 "$bmark_cmd" "$n" $(( (bmark_loops + n/2) / n ))
+
+    # Compute overhead and append as last column
+    ohead=$(awk -v b="$BM_WALL_VAL" -v a="$BASE_BM_WALL" 'BEGIN{ if (a>0) printf "%.3f", (b/a - 1.0)*100; else print "NaN" }')
+    echo -n "$ohead" >> "$outf"
+
+    sleep 45
+    echo "" >> "$outf"
 }
 
-n=$core_ct
-padding=0
+if [ "$bmark_cmd" = "run_browser" ]; then
+    n=1
+    (
+        cd "$EVAL_DIR/browser" || exit 1
+        mkdir -p tmp
+        shuf -n 20 urls.csv > tmp/sampled_urls.csv
+        python3 sample-urls.py tmp/sampled_urls.csv tmp/bm_urls "$bmark_loops"
+        cd tmp || exit 1
+        split -l 10 -a 1 -d bm_urls url_batch_
+    ) || exit 1
+else
+  n=8 #$core_ct
+fi
+
 i=Warmup
 outf=/dev/null
 loop_body
-outf=$outfile
+i=1
+outf="$outfile"
 
 if [ ! -f "$outf" ]; then
-    echo "bmark,trial,padding,cores,base_bm_wall,base_bm_usr,base_bm_sys," \
-         "base_ag_usr,base_ag_sys,bm_wall,bm_usr,bm_sys," \
-         "ag_usr,ag_sys,sc,lost,scsize,cachesize,p,w" > $outf
+    echo "config,log_config,bmark,trial,cores," \
+         "base_bm_wall,base_bm_usr,base_bm_sys," \
+         "base_ag_usr,base_ag_sys,base_ag_wall," \
+         "bm_wall,bm_usr,bm_sys,ag_usr,ag_sys,ag_wall," \
+         "sc,sent,lost,scsize,cachesize,p,w,ohead" > "$outf"
 fi
 
-for (( i=0; i < $iterations; i++ )); do
-    for (( n=1; n <= $core_ct; n+=n )); do
-        for (( padding=0; padding <= max_padding; padding+=32 )); do
-            loop_body
-        done
-    done 
-    if (( n > $core_ct && n < 2*$core_ct )); then # handle cases where core_ct isn't 2^k
-        n=$core_ct
-        for (( padding=0; padding <= max_padding; padding+=32 )); do
-            loop_body
-        done
+# --- LOG DESTINATION (LOCAL vs REMOTE) ---
+if [ "$log_mode" = "local" ]; then
+    declare -a log_configs=("$logfile")
+else
+    declare -a log_configs=()
+    add_ssh_configs() {
+        server=$1
+        user=$2
+        declare -a ssh_configs=("ssh://$user@$server/$logfile")
+        log_configs+=("${ssh_configs[@]}")
+    }
+    if [[ -z "${ssh_user:-}" || -z "${ssh_server:-}" ]]; then
+        echo "Error: remote logging selected but SSH username and/or server not provided." >&2
+        echo "Usage (tail args): ... -A* ... remote <ssh_user> <ssh_server>" >&2
+        exit 1
     fi
+    add_ssh_configs "$ssh_server" "$ssh_user"
+fi
+
+for (( i=0; i < iterations; i++ )); do
+    for log_config in "${log_configs[@]}"; do
+        for param_config in "${param_configs[@]}"; do
+            for (( n=1; n <= core_ct; n+=n )); do
+                loop_body
+            done
+            if (( n > core_ct && n < 2*core_ct )); then
+                n=$core_ct
+                loop_body
+            fi
+        done
+    done
 done
+
+# if [ "$bmark_cmd" = "run_browser" ]; then
+#     rm -r browser/tmp
+# fi

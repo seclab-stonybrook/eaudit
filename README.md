@@ -57,11 +57,14 @@ See the file **INSTALL**.
 
 ## Usage
 
-There are two top-level programs: **ecapd** and **eaudit**. **ecapd** is for
-logging system calls, while **eaudit** is used to parse/print the collected logs
-in a human readable format. Being based on **ebpf**, **ecapd** requires root
-privilege to run. Both programs support a **-h** option that prints a help
-message documenting the command-line options.
+There are three top-level programs: **ecapd** , **eauditd** and **eaudit**. 
+**ecapd** is for logging system calls, while **eaudit** is used to parse/print 
+the collected logs in a human readable format. **eauditd** parses the 
+events online filling the missing information by querying /proc and creates
+a record file that can be consumed by HOST for provenance analysis. Being based 
+on **ebpf**, **ecapd** and **eauditd** requires root privilege to run. **eaudit** 
+needs some permissions to read the record file. All three programs support a **-h** 
+option that prints a help message documenting the command-line options.
 
 ## Prevention and Detection Modes
 
@@ -72,43 +75,10 @@ tamper protection. The new support is exposed through two operating modes:
   configuration and is used to evaluate how buffering and flushing policies
   reduce the window in which audit data can be modified before it is preserved.
   Scripts pass this mode by using the argument `prevention`.
-* **detection** enables tamper-detection support. The logger signs records with
-  UMAC3 metadata by passing `-H` to **ecapd**, and the resulting log can be
+* **detection** enables tamper-detection support. The logger appends MACs to
+  records by passing `-H` to **ecapd**, and the resulting log can be
   parsed with `eaudit -L -V` so the parser verifies the MACs and detects
-  modified audit records.
-
-The mode is exposed as the `defense` argument in the tamper-window scripts:
-
-```
-prevention | detection
-```
-
-## Tamper Window Evaluation Scripts
-
-Tamper-window measurement scripts live in `eval/tamper_win/`:
-
-* `low_load_tw` runs only the logger for a fixed duration and then invokes
-  **eaudit** to compute the average tamper window.
-* `high_load_tw` runs a benchmark workload while the logger is active and then
-  invokes **eaudit** to compute the average tamper window.
-
-The helper scripts used by these entry points are in `eval/`:
-
-* `bgrun_remote`
-* `bmremote`
-* `bmrunall-remote`
-
-`bmremote` is the main benchmark helper script. Its output includes the
-benchmark overhead percentage column (`ohead`). Use the script's parameter
-information to pass the correct values for a specific experiment.
-
-The scripts resolve paths relative to their own locations. `ecapd` and
-`eaudit` are run from the repository root, and benchmark commands such as
-`run_httperf` are resolved under `eval/`.
-
-The generated CSV includes the selected defense mode, log destination, trial
-number, and average tamper-window value. See each script's parameter
-information for the correct values to pass for a specific experiment.
+  tampered audit records.
 
 ## Behind the scene
 
@@ -128,8 +98,12 @@ the program that parses capture files and produces a human-readable output.
   Scalable and Deployable Audit Data Collection System </a> R. Sekar, Hanke
   Kimm, and Rohit Aich Stony Brook University, NY, USA.
 
+* <a href="http://seclab.cs.sunysb.edu/seclab/pubs/etamper.pdf">Sealing the
+  Window: Efficient Tamper Protection for Provenance Logs </a> Sagar Mishra and
+  R. Sekar Stony Brook University, NY, USA.
+
 ## Copyright
 
 ********************************************************************************
- Copyright (c) 2022-23, R. Sekar and Secure Systems Lab, Stony Brook University
+ Copyright (c) 2022-26, R. Sekar and Secure Systems Lab, Stony Brook University
 ********************************************************************************

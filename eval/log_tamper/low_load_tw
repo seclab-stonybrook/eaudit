@@ -1,0 +1,58 @@
+#!/bin/bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVAL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [[ "$1" == "-h" || "$1" == "--help" || $# -lt 1 || $# -gt 9 ]]; then
+    echo "Usage: $0 <outfile> [iterations [defense [cache_time [flush_interval [duration [log_mode [ssh_user [ssh_server]]]]]]]]"
+    echo "  outfile        : output data filename (e.g., results.csv)"
+    echo "  iterations     : integer               (default: 1)"
+    echo "  defense        : prevention|detection  (default: prevention)"
+    echo "  cache_time     : integer               (default: 667000)"
+    echo "  flush_interval : seconds               (default: 0.001)"
+    echo "  test_duration  : seconds               (default: 3600)"
+    echo "  log_mode       : local|remote          (default: local)"
+    echo "  ssh_user       : required if remote"
+    echo "  ssh_server     : required if remote"
+    echo ""
+    echo "Examples:"
+    echo "  Local :  $0 out.csv 1 prevention 670000 0.001 180 local"
+    echo "  Remote:  $0 out.csv 1 prevention 670000 0.001 180 remote user host"
+    exit 1
+fi
+
+outfile="$1"
+iteration="${2:-1}"
+defense="${3:-prevention}"
+cache_time="${4:-667000}"
+flush_interval="${5:-0.001}"
+duration="${6:-3600}"
+log_mode="${7:-local}"
+user="${8:-}"
+server="${9:-}"
+
+# Basic validation
+
+[[ "$log_mode" == "local" || "$log_mode" == "remote" ]] || {
+  echo "Error: log_mode must be 'local' or 'remote'." >&2; exit 1; }
+
+[[ "$defense" == "prevention" || "$defense" == "detection" ]] || {
+  echo "Error: defense must be 'prevention' or 'detection'." >&2; exit 1; }
+
+if [[ "$log_mode" == "remote" ]]; then
+  if [[ -z "${user:-}" || -z "${server:-}" ]]; then
+    echo "Error: remote logging selected but ssh_user and/or ssh_server missing." >&2
+    exit 1
+  fi
+fi
+
+if [[ "${outfile##*.}" != "csv" ]]; then
+    echo "data file name should have a csv suffix" && exit 1
+fi
+
+args=("$SCRIPT_DIR/low_load_tw_runner" "$outfile" "$iteration" "$defense" "$cache_time" "$flush_interval" "$duration" "$log_mode")
+if [[ "$log_mode" == "remote" ]]; then
+  args+=("$user" "$server")
+fi
+
+"${args[@]}"

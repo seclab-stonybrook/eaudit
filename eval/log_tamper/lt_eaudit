@@ -45,7 +45,7 @@ do_script() {
     for (( loop=0; loop<$trial_loops; loop++ )); do
 
         (cd ../..
-        sudo EAUDIT_SO="./ecapd.so" EAUDIT_UID=65534 EAUDIT_GID=65534 time python3 eauditd.py -s -v2 -b 2.0 -r 16 -w 8 -c /tmp/foo.log &> /tmp/log_tamp.txt &
+        sudo EAUDIT_SO="./ecapd.so" EAUDIT_UID=65534 EAUDIT_GID=65534 time python3 eauditd.py -s -v2 -b 2.0 -r 16 -w 8 -- -C /tmp/foo.log &> /tmp/log_tamp.txt &
         echo "Sleeping for 15 seconds before starting benchmark..."
         sleep 15
         cd eval

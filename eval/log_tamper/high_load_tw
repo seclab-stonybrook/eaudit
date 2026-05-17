@@ -1,0 +1,230 @@
+#!/bin/bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVAL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ROOT_DIR="$(cd "$EVAL_DIR/.." && pwd)"
+
+core_ct=8
+iterations=1
+pcpu_buf=1.6
+wakeup_int=8
+bmark_cmd="run_pm pm-config.sm"
+bmark_loops=$core_ct
+rbuf=16
+defense="prevention"
+cache_time=667000
+flush_interval=0.002
+log_mode="local"
+ssh_user=""
+ssh_server=""
+
+# Help / usage
+if (( $# == 0 || $# > 12 )) || [[ "$1" == "-h" || "$1" == "--help" || "$1" == "help" ]]; then
+   echo "Usage:"
+   echo "  $0 outfile [benchmark_cmd [benchmark_loops [per_cpu_buffer [wakeup_interval"
+   echo "      [iterations [defense [cache_time [flush_interval [log_mode [ssh_user [ssh_server]]]]]]]]]]]"
+   echo ""
+   echo "Defaults:"
+   echo "  benchmark_cmd=$bmark_cmd"
+   echo "  benchmark_loops=$bmark_loops"
+   echo "  per_cpu_buffer=$pcpu_buf"
+   echo "  wakeup_interval=$wakeup_int"
+   echo "  iterations=$iterations"
+   echo "  defense=$defense (prevention|detection)"
+   echo "  cache_time=$cache_time"
+   echo "  flush_interval=$flush_interval"
+   echo "  log_mode=$log_mode   (local|remote)"
+   echo "  ssh_user=$ssh_user"
+   echo "  ssh_server=$ssh_server"
+   echo ""
+   echo "Examples:"
+   echo "  Local :  $0 out.csv run_redis 8 1.6 8 1 prevention 670000 0.002 local"
+   echo "  Remote:  $0 out.csv run_redis 8 1.6 8 1 prevention 670000 0.002 remote user host"
+   exit 1
+fi
+
+outfile="$1"
+bmark_cmd=${2:-$bmark_cmd}
+bmark_loops=${3:-$bmark_loops}
+pcpu_buf=${4:-$pcpu_buf}
+wakeup_int=${5:-$wakeup_int}
+iterations=${6:-$iterations}
+defense=${7:-$defense}
+cache_time=${8:-$cache_time}
+flush_interval=${9:-$flush_interval}
+log_mode=${10:-$log_mode}   # "local" or "remote"
+ssh_user=${11:-"$ssh_user"} # username for remote mode
+ssh_server=${12:-"$ssh_server"} # server for remote mode
+
+bmark_nm=$(echo "$bmark_cmd" | awk '{print $1}')
+
+logfile="/tmp/$outfile.log"
+bmoutfile="/tmp/$outfile.bm"
+agoutfile="/tmp/$outfile.ag"
+diag_prefix="eaudit_diagnostic:"
+parserFile="/tmp/$outfile.prt"
+log_config="$logfile"
+if [[ "${outfile##*.}" != "csv" ]]; then
+    echo "outfile should have a csv suffix" && exit 1
+fi
+if [[ "$defense" != "prevention" && "$defense" != "detection" ]]; then
+    echo "defense must be 'prevention' or 'detection'" >&2
+    exit 1
+fi
+if [[ "$log_mode" != "local" && "$log_mode" != "remote" ]]; then
+    echo "log_mode must be 'local' or 'remote'" >&2
+    exit 1
+fi
+if [[ "$log_mode" == "remote" && ( -z "${ssh_user:-}" || -z "${ssh_server:-}" ) ]]; then
+    echo "remote log_mode requires <ssh_user> <ssh_server>" >&2
+    exit 1
+fi
+
+require_sudo() {
+    if (( "$(id -u)" != 0 )); then
+        sudo -v || {
+            echo "sudo authentication failed; aborting before starting benchmark/logger" >&2
+            exit 1
+        }
+    fi
+}
+
+require_sudo
+
+( cd "$ROOT_DIR" && make all ) || exit 1
+if [ "$defense" = "detection" ]; then
+    ( cd "$ROOT_DIR" && make eauditd-tamper ) || exit 1
+fi
+
+bmark() {
+    echo "rx:./$*\n"
+    ( cd "$EVAL_DIR" && ./$* >& "$bmoutfile" )
+}
+
+agent_stats() {
+     if (( $# > 1 )); then
+        require_sudo
+        if [[ "$log_config" == ssh://* ]]; then
+            scp "$ssh_user@$ssh_server:$logfile" "$logfile"
+        fi
+
+        if [ "$defense" = "detection" ] && [ "$param_config" != "-A 0" ]; then
+            (cd "$ROOT_DIR" && sudo ./eaudit -I "$logfile" -L -V) &> "$parserFile"
+        else
+            (cd "$ROOT_DIR" && sudo ./eaudit -I "$logfile") &> "$parserFile"
+        fi
+
+        avg_tamper_window=$(grep -a "Avg tamper window" "$parserFile" | awk '{print $4}' FS=' ' | awk '{print $1}' FS='ms')
+        echo -n  "$avg_tamper_window,$cache_time,$flush_interval"      \
+             >> "$outf"
+    fi
+}
+
+agent() {
+    require_sudo
+
+    if [ "$param_config" = "-A 0" ]; then
+        args_prefix="-m $diag_prefix -s -v2 -b $pcpu_buf -r $rbuf -w $wakeup_int -C"
+        args_suffix="-- -C $log_config"
+    elif [ "$param_config" = "-A 1" ]; then
+        args_prefix="-m $diag_prefix -s -v2 -b $pcpu_buf -r $rbuf -w $wakeup_int $param_config -t $cache_time"
+        args_suffix="-- -C $log_config"
+    elif [ "$param_config" = "-A 2" ]; then
+        args_prefix="-m $diag_prefix -s -v2 -b $pcpu_buf -r $rbuf -w $wakeup_int $param_config -t $cache_time"
+        args_suffix="-- -C $log_config -f $flush_interval"
+    else
+        args_prefix="-m $diag_prefix -s -v2 -b $pcpu_buf -r $rbuf -w $wakeup_int $param_config -t $cache_time"
+        args_suffix="-- -C $log_config -f $flush_interval"
+    fi
+    
+    if [ "$defense" = "detection" ] && [ "$param_config" != "-A 0" ]; then
+        args="$args_prefix -H $args_suffix"
+    else
+        args="$args_prefix $args_suffix"
+    fi
+    
+    
+    # echo  "Logger Config::$args"
+    ( cd "$ROOT_DIR" && ./ecapd $args >& "$agoutfile" ) &
+    agent_pid=$!
+    sleep 60
+    if ! kill -0 "$agent_pid" 2>/dev/null; then
+        echo "failed: logger exited before benchmark; see $agoutfile" >&2
+        exit 1
+    fi
+    shift
+    if (( $# > 1 )); then
+        bmark $*
+    fi
+    require_sudo
+    wrapper=sudo
+    if (( "$(id -u)" == 0 )); then
+        wrapper=
+    fi
+
+    kill_tree() {
+        local pid="$1"
+        local child
+        for child in $(pgrep -P "$pid" 2>/dev/null); do
+            kill_tree "$child"
+        done
+        $wrapper kill "$pid" 2>/dev/null || true
+    }
+
+    kill_tree "$agent_pid"
+    wait "$agent_pid" 2>/dev/null || true
+    sleep 15
+    agent_stats $*
+}
+
+loop_body() {
+    echo -n "$param_config,$log_config,$defense,$bmark_nm,$i,$n," >> "$outf"
+    echo -n "config=$param_config log=$log_config i=$i	n=$n:	benchmark "
+    # Keep the total workload roughly constant, regardless of the # of cores 
+    # used: so, 1-core load iterates 12 times, while a 12-core load iterates once.
+    # Adding $n/2 to numerator meand we round rather than truncate. 
+    bmark $bmark_cmd $n $(( ($bmark_loops + $n/2)/$n ))
+    sleep 15 # Some time for caches to clear?
+    echo -n "agent "
+    agent 0
+    echo -n "both"
+    agent 0 $bmark_cmd $n $(( ($bmark_loops + $n/2)/$n ))
+    sleep 45 # Some time for caches to clear?
+    echo ""
+    echo "" >> "$outf"
+}
+
+i=Warmup
+outf=/dev/null
+# loop_body
+i=1
+outf=$outfile
+
+if [ ! -f "$outf" ]; then
+    echo "e_config,log_config,defense,bmark,trial,cores,"                     \
+         "avg_tw,cache_time,flush_int" > "$outf"
+fi
+
+################################################################################
+# Can change which algorithm to flush with, default measures all algorithm
+# A 0 = eaudit, A 1 = Community, A 2 = user-level, A 3 = hybrid
+################################################################################
+declare -a param_configs=("-A 0" "-A 1" "-A 2" "-A 3")
+# declare -a param_configs=("-A 1")
+# declare -a param_configs=("")
+if [ "$log_mode" = "local" ]; then
+    declare -a log_configs=("$logfile")
+else
+    declare -a log_configs=("ssh://$ssh_user@$ssh_server/$logfile")
+fi
+
+for (( i=0; i < $iterations; i++ )); do
+    for log_config in "${log_configs[@]}"; do
+        for param_config in "${param_configs[@]}"; do
+            for (( n=3; n <= 3; n+=n )); do
+                loop_body
+            done 
+            
+        done
+    done
+done

@@ -2,7 +2,7 @@
  *  Copyright 2022-23 R. Sekar and Secure Systems Lab, Stony Brook University
  *******************************************************************************
  * THIS IS PROPRIETARY SOFTWARE. ALL RIGHTS RESERVED.
- ********************************************************
+ ********************************************************/
 // We moved to running the consumer online at data collection time. This
 // will allow us to query the OS for all the missing pieces of info. We need
 // some invariants to proceed: (a) subject needs to be auto created or updated

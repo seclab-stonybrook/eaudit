@@ -1,0 +1,32 @@
+#!/bin/bash
+
+if (( $# != 2 )); then
+    echo "Usage: $0 <number_of_parallel_tasks> <total_iterations>"
+    exit 1
+fi
+
+tasks=$1         # Number of parallel tasks (cores/threads)
+total_iter=$2    # Total number of operations.
+
+if (( total_iter % tasks != 0 )); then
+    echo "Error: Total iterations ($total_iter) must be divisible by number of tasks ($tasks)"
+    exit 1
+fi
+
+echo "Running $tasks parallel tasks"
+echo "Each task will run $iter_per_task iterations"
+
+do_benchmark() {
+    task_id=$1
+    echo "Task $task_id starting..."
+     redis-benchmark -c $((5 * $1)) -t set,get -r $2 -n $2 -P $((8 / $1)) > /dev/null
+
+    echo "Task $task_id done."
+}
+
+time (
+    for (( i=1; i <= tasks; i++ )); do
+        (do_benchmark $i $total_iter) &
+    done
+    wait
+)

@@ -103,3 +103,31 @@ facilitate results reproduction. But there are many caveats in this regard:
 * Measurement scripts produce only a single measurement. They need to be run
    multiple times so that one can average across multiple measurements.
 
+## Tamper Window Evaluation Scripts
+
+Tamper-window measurement scripts live in `eval/log_tamper/`.
+
+`lt_eaudit` is the tamper-window measurement script for the eAudit paper
+evaluation.
+
+The Winseal paper evaluation uses these tamper-window scripts:
+
+* `low_load_tw` runs only the logger for a fixed duration and then invokes
+  **eaudit** to compute the average tamper window.
+* `high_load_tw` runs a benchmark workload while the logger is active and then
+  invokes **eaudit** to compute the average tamper window.
+
+`low_load_tw` uses `eval/log_tamper/low_load_tw_runner` as its local helper.
+Run `low_load_tw` directly for normal low-load measurements.
+
+`bmremote` is the main benchmark helper script. Its output includes the
+benchmark overhead percentage column (`ohead`). Use the script's parameter
+information to pass the correct values for a specific experiment.
+
+The scripts resolve paths relative to their own locations. `ecapd` and
+`eaudit` are run from the repository root, and benchmark commands such as
+`run_httperf` are resolved under `eval/`.
+
+The generated CSV includes the selected defense mode, log destination, trial
+number, and average tamper-window value. See each script's parameter
+information for the correct values to pass for a specific experiment.
